@@ -1,8 +1,7 @@
 name: Update Uplink Schema
 run-name: ${{ github.actor }} is updating the Uplink schema 🚀
 on:
-  - workflow_dispatch
-  - schedule:
+  schedule:
     - cron:  '*/5 * * * *'
 jobs:
   Update-Uplink-Schema:
