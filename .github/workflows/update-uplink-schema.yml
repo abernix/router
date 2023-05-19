@@ -1,6 +1,9 @@
 name: Update Uplink Schema
 run-name: ${{ github.actor }} is updating the Uplink schema 🚀
-on: workflow_dispatch
+on:
+  - workflow_dispatch
+  - schedule:
+    - cron:  '*/5 * * * *'
 jobs:
   Update-Uplink-Schema:
     runs-on: ubuntu-latest
@@ -13,7 +16,7 @@ jobs:
       - name: Make changes to pull request
         run: |
           rover graph introspect https://uplink.api.apollographql.com/ | perl -pe 'chomp if eof' > ./apollo-router/src/uplink/uplink.graphql
-          echo "# $(date +%s)" >> ./apollo-router/src/uplink/uplink.graphql
+          echo "# $(date)" >> ./apollo-router/src/uplink/uplink.graphql
       - name: Create Pull Request
         id: cpr
         uses: peter-evans/create-pull-request@v5
