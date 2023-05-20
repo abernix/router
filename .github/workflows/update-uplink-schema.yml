@@ -2,7 +2,7 @@ name: Update Uplink Schema
 run-name: ${{ github.actor }} is updating the Uplink schema 🚀
 on:
   schedule:
-    - cron:  '*/5 * * * *'
+    - cron:  '5 */9 * * *'
 jobs:
   Update-Uplink-Schema:
     runs-on: ubuntu-latest
