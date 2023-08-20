@@ -1,1 +1,2 @@
---files-except .changesets/*.md --target dev +title+ Include a Changeset
+--files-except .changesets/*.md +title+ Changesets
+--files-except .changesets/*.md +task+ Include a file in `.changesets` documenting your change.
