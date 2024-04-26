@@ -1,71 +1,67 @@
 //! Tower fetcher for subgraphs.
 
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
 
-use ::serde::Deserialize;
-use async_compression::tokio::write::BrotliEncoder;
-use async_compression::tokio::write::GzipEncoder;
-use async_compression::tokio::write::ZlibEncoder;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::SinkExt;
 use futures::StreamExt;
 use futures::TryFutureExt;
-use global::get_text_map_propagator;
 use http::header::ACCEPT;
-use http::header::ACCEPT_ENCODING;
-use http::header::CONTENT_ENCODING;
 use http::header::CONTENT_TYPE;
 use http::header::{self};
 use http::response::Parts;
-use http::HeaderMap;
 use http::HeaderValue;
 use http::Request;
-use hyper::client::HttpConnector;
 use hyper::Body;
-use hyper::Client;
 use hyper_rustls::ConfigBuilderExt;
-use hyper_rustls::HttpsConnector;
+use itertools::Itertools;
 use mediatype::names::APPLICATION;
 use mediatype::names::JSON;
 use mediatype::MediaType;
 use mime::APPLICATION_JSON;
-use opentelemetry::global;
 use rustls::RootCertStore;
-use schemars::JsonSchema;
 use serde::Serialize;
-use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::util::BoxService;
 use tower::BoxError;
 use tower::Service;
-use tower::ServiceBuilder;
 use tower::ServiceExt;
-use tower_http::decompression::Decompression;
-use tower_http::decompression::DecompressionLayer;
+use tracing::instrument;
 use tracing::Instrument;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
+use super::http::HttpClientServiceFactory;
+use super::http::HttpRequest;
 use super::layers::content_negotiation::GRAPHQL_JSON_RESPONSE_HEADER_VALUE;
 use super::Plugins;
+use crate::batching::assemble_batch;
+use crate::batching::BatchQuery;
+use crate::batching::BatchQueryInfo;
+use crate::configuration::Batching;
+use crate::configuration::BatchingMode;
+use crate::configuration::TlsClientAuth;
 use crate::error::FetchError;
+use crate::error::SubgraphBatchingError;
 use crate::graphql;
 use crate::json_ext::Object;
+use crate::plugins::authentication::subgraph::SigningParamsConfig;
+use crate::plugins::file_uploads;
 use crate::plugins::subscription::create_verifier;
 use crate::plugins::subscription::CallbackMode;
 use crate::plugins::subscription::SubscriptionConfig;
 use crate::plugins::subscription::SubscriptionMode;
 use crate::plugins::subscription::WebSocketConfiguration;
 use crate::plugins::subscription::SUBSCRIPTION_WS_CUSTOM_CONNECTION_PARAMS;
+use crate::plugins::telemetry::config_new::events::log_event;
+use crate::plugins::telemetry::config_new::events::SubgraphEventRequestLevel;
+use crate::plugins::telemetry::config_new::events::SubgraphEventResponseLevel;
 use crate::plugins::telemetry::LOGGING_DISPLAY_BODY;
 use crate::plugins::telemetry::LOGGING_DISPLAY_HEADERS;
 use crate::protocols::websocket::convert_websocket_stream;
@@ -74,6 +70,7 @@ use crate::query_planner::OperationKind;
 use crate::services::layers::apq;
 use crate::services::SubgraphRequest;
 use crate::services::SubgraphResponse;
+use crate::Configuration;
 use crate::Context;
 use crate::Notify;
 
@@ -87,11 +84,14 @@ const HASH_VERSION_KEY: &str = "version";
 const HASH_VERSION_VALUE: i32 = 1;
 const HASH_KEY: &str = "sha256Hash";
 const GRAPHQL_RESPONSE: mediatype::Name = mediatype::Name::new_unchecked("graphql-response");
-const POOL_IDLE_TIMEOUT_DURATION: Option<Duration> = Some(Duration::from_secs(5));
 
-// interior mutability is not a concern here, the value is never modified
 #[allow(clippy::declare_interior_mutable_const)]
-const ACCEPTED_ENCODINGS: HeaderValue = HeaderValue::from_static("gzip, br, deflate");
+static CALLBACK_PROTOCOL_ACCEPT: HeaderValue =
+    HeaderValue::from_static("application/json;callbackSpec=1.0");
+pub(crate) static APPLICATION_JSON_HEADER_VALUE: HeaderValue =
+    HeaderValue::from_static("application/json");
+static ACCEPT_GRAPHQL_JSON: HeaderValue =
+    HeaderValue::from_static("application/json, application/graphql-response+json");
 
 enum APQError {
     PersistedQueryNotSupported,
@@ -99,42 +99,22 @@ enum APQError {
     Other,
 }
 
-#[derive(PartialEq, Debug, Clone, Deserialize, JsonSchema, Copy)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Compression {
-    /// gzip
-    Gzip,
-    /// deflate
-    Deflate,
-    /// brotli
-    Br,
-}
-
-impl Display for Compression {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Compression::Gzip => write!(f, "gzip"),
-            Compression::Deflate => write!(f, "deflate"),
-            Compression::Br => write!(f, "br"),
-        }
-    }
-}
-
-#[cfg_attr(test, derive(Deserialize))]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 struct SubscriptionExtension {
     subscription_id: String,
     callback_url: url::Url,
     verifier: String,
+    heartbeat_interval_ms: u64,
 }
 
 /// Client for interacting with subgraphs.
 #[derive(Clone)]
 pub(crate) struct SubgraphService {
-    // Note: We use hyper::Client here in preference to reqwest to avoid expensive URL translation
-    // in the hot path. We use reqwest elsewhere because it's convenient and some of the
-    // opentelemetry crate require reqwest clients to work correctly (at time of writing).
-    client: Decompression<hyper::Client<HttpsConnector<HttpConnector>>>,
+    // we hold a HTTP client service factory here because a service with plugins applied
+    // cannot be cloned
+    pub(crate) client_factory: HttpClientServiceFactory,
     service: Arc<String>,
 
     /// Whether apq is enabled in the router for subgraph calls
@@ -150,52 +130,69 @@ pub(crate) struct SubgraphService {
 }
 
 impl SubgraphService {
+    pub(crate) fn from_config(
+        service: impl Into<String>,
+        configuration: &Configuration,
+        subscription_config: Option<SubscriptionConfig>,
+        client_factory: HttpClientServiceFactory,
+    ) -> Result<Self, BoxError> {
+        let name: String = service.into();
+
+        let enable_apq = configuration
+            .apq
+            .subgraph
+            .subgraphs
+            .get(&name)
+            .map(|apq| apq.enabled)
+            .unwrap_or(configuration.apq.subgraph.all.enabled);
+
+        SubgraphService::new(
+            name,
+            enable_apq,
+            subscription_config,
+            configuration.notify.clone(),
+            client_factory,
+        )
+    }
+
     pub(crate) fn new(
         service: impl Into<String>,
         enable_apq: bool,
-        tls_cert_store: Option<RootCertStore>,
-        enable_http2: bool,
         subscription_config: Option<SubscriptionConfig>,
         notify: Notify<String, graphql::Response>,
-    ) -> Self {
-        let mut http_connector = HttpConnector::new();
-        http_connector.set_nodelay(true);
-        http_connector.set_keepalive(Some(std::time::Duration::from_secs(60)));
-        http_connector.enforce_http(false);
-        let tls_config = match tls_cert_store {
-            None => rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_native_roots()
-                .with_no_client_auth(),
-            Some(store) => rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(store)
-                .with_no_client_auth(),
-        };
-        let builder = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http()
-            .enable_http1();
-
-        let connector = if enable_http2 {
-            builder.enable_http2().wrap_connector(http_connector)
-        } else {
-            builder.wrap_connector(http_connector)
-        };
-
-        let http_client = hyper::Client::builder()
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT_DURATION)
-            .build(connector);
-        Self {
-            client: ServiceBuilder::new()
-                .layer(DecompressionLayer::new())
-                .service(http_client),
+        client_factory: crate::services::http::HttpClientServiceFactory,
+    ) -> Result<Self, BoxError> {
+        Ok(Self {
+            client_factory,
             service: Arc::new(service.into()),
             apq: Arc::new(<AtomicBool>::new(enable_apq)),
             subscription_config,
             notify,
-        }
+        })
     }
+}
+
+pub(crate) fn generate_tls_client_config(
+    tls_cert_store: Option<RootCertStore>,
+    client_cert_config: Option<&TlsClientAuth>,
+) -> Result<rustls::ClientConfig, BoxError> {
+    let tls_builder = rustls::ClientConfig::builder().with_safe_defaults();
+    Ok(match (tls_cert_store, client_cert_config) {
+        (None, None) => tls_builder.with_native_roots().with_no_client_auth(),
+        (Some(store), None) => tls_builder
+            .with_root_certificates(store)
+            .with_no_client_auth(),
+        (None, Some(client_auth_config)) => tls_builder.with_native_roots().with_client_auth_cert(
+            client_auth_config.certificate_chain.clone(),
+            client_auth_config.key.clone(),
+        )?,
+        (Some(store), Some(client_auth_config)) => tls_builder
+            .with_root_certificates(store)
+            .with_client_auth_cert(
+                client_auth_config.certificate_chain.clone(),
+                client_auth_config.key.clone(),
+            )?,
+    })
 }
 
 impl tower::Service<SubgraphRequest> for SubgraphService {
@@ -203,13 +200,11 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
     type Error = BoxError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.client
-            .poll_ready(cx)
-            .map(|res| res.map_err(|e| Box::new(e) as BoxError))
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: SubgraphRequest) -> Self::Future {
+    fn call(&mut self, mut request: SubgraphRequest) -> Self::Future {
         let subscription_config = (request.operation_kind == OperationKind::Subscription)
             .then(|| self.subscription_config.clone())
             .flatten();
@@ -245,12 +240,12 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
 
         let (_, mut body) = subgraph_request.into_parts();
 
-        let clone = self.client.clone();
-        let client = std::mem::replace(&mut self.client, clone);
+        let client_factory = self.client_factory.clone();
 
         let arc_apq_enabled = self.apq.clone();
 
         let mut notify = self.notify.clone();
+
         let make_calls = async move {
             // Subscription handling
             if request.operation_kind == OperationKind::Subscription
@@ -278,7 +273,9 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
                         .await;
                     }
                     Some(SubscriptionMode::Callback(CallbackMode {
-                        public_url, path, ..
+                        public_url,
+                        heartbeat_interval,
+                        ..
                     })) => {
                         // Hash the subgraph_request
                         let subscription_id = hashed_request;
@@ -289,14 +286,14 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
                             .await?;
 
                         // If it existed before just send the right stream (handle) and early return
-                        let mut stream_tx =
-                            request.subscription_stream.clone().ok_or_else(|| {
-                                FetchError::SubrequestWsError {
-                                    service: service_name.clone(),
-                                    reason: "cannot get the callback stream".to_string(),
-                                }
-                            })?;
-                        stream_tx.send(handle.into_stream()).await?;
+                        let stream_tx = request.subscription_stream.clone().ok_or_else(|| {
+                            FetchError::SubrequestWsError {
+                                service: service_name.clone(),
+                                reason: "cannot get the callback stream".to_string(),
+                            }
+                        })?;
+                        stream_tx.send(Box::pin(handle.into_stream())).await?;
+
                         tracing::info!(
                             monotonic_counter.apollo.router.operations.subscriptions = 1u64,
                             subscriptions.mode = %"callback",
@@ -317,10 +314,16 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
 
                         // If not then put the subscription_id in the extensions for callback mode and continue
                         // Do this if the topic doesn't already exist
-                        let callback_url = public_url.join(&format!(
-                            "{}/{subscription_id}",
-                            path.as_deref().unwrap_or("/callback")
-                        ))?;
+                        let mut callback_url = public_url.clone();
+                        if callback_url.path_segments_mut().is_err() {
+                            callback_url = callback_url.join(&subscription_id)?;
+                        } else {
+                            callback_url
+                                .path_segments_mut()
+                                .expect("can't happen because we checked before")
+                                .push(&subscription_id);
+                        }
+
                         // Generate verifier
                         let verifier = create_verifier(&subscription_id).map_err(|err| {
                             FetchError::SubrequestHttpError {
@@ -329,19 +332,27 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
                                 status_code: None,
                             }
                         })?;
+                        request
+                            .subgraph_request
+                            .headers_mut()
+                            .append(ACCEPT, CALLBACK_PROTOCOL_ACCEPT.clone());
 
                         let subscription_extension = SubscriptionExtension {
                             subscription_id,
                             callback_url,
                             verifier,
+                            heartbeat_interval_ms: heartbeat_interval
+                                .into_option()
+                                .map(|duration| duration.as_millis() as u64)
+                                .unwrap_or(0),
                         };
                         body.extensions.insert(
                             "subscription",
-                            serde_json_bytes::to_value(subscription_extension).map_err(|_err| {
+                            serde_json_bytes::to_value(subscription_extension).map_err(|err| {
                                 FetchError::SubrequestHttpError {
                                     service: service_name.clone(),
-                                    reason: String::from(
-                                        "cannot serialize the subscription extension",
+                                    reason: format!(
+                                        "cannot serialize the subscription extension: {err:?}",
                                     ),
                                     status_code: None,
                                 }
@@ -361,7 +372,14 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
             // with the same request body.
             let apq_enabled = arc_apq_enabled.as_ref();
             if !apq_enabled.load(Relaxed) {
-                return call_http(request, body, context, client, &service_name).await;
+                return call_http(
+                    request,
+                    body,
+                    context,
+                    client_factory.clone(),
+                    &service_name,
+                )
+                .await;
             }
 
             // Else, if APQ is enabled,
@@ -395,7 +413,7 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
                 request.clone(),
                 apq_body.clone(),
                 context.clone(),
-                client.clone(),
+                client_factory.clone(),
                 &service_name,
             )
             .await?;
@@ -408,11 +426,25 @@ impl tower::Service<SubgraphRequest> for SubgraphService {
             match get_apq_error(gql_response) {
                 APQError::PersistedQueryNotSupported => {
                     apq_enabled.store(false, Relaxed);
-                    call_http(request, body, context, client, &service_name).await
+                    call_http(
+                        request,
+                        body,
+                        context,
+                        client_factory.clone(),
+                        &service_name,
+                    )
+                    .await
                 }
                 APQError::PersistedQueryNotFound => {
                     apq_body.query = query;
-                    call_http(request, apq_body, context, client, &service_name).await
+                    call_http(
+                        request,
+                        apq_body,
+                        context,
+                        client_factory.clone(),
+                        &service_name,
+                    )
+                    .await
                 }
                 _ => Ok(response),
             }
@@ -431,12 +463,19 @@ async fn call_websocket(
     subgraph_cfg: &WebSocketConfiguration,
     subscription_hash: String,
 ) -> Result<SubgraphResponse, BoxError> {
+    let operation_name = request
+        .subgraph_request
+        .body()
+        .operation_name
+        .clone()
+        .unwrap_or_default();
+
     let SubgraphRequest {
         subgraph_request,
         subscription_stream,
         ..
     } = request;
-    let mut subscription_stream_tx =
+    let subscription_stream_tx =
         subscription_stream.ok_or_else(|| FetchError::SubrequestWsError {
             service: service_name.clone(),
             reason: "cannot get the websocket stream".to_string(),
@@ -445,7 +484,6 @@ async fn call_websocket(
     let (handle, created) = notify
         .create_or_subscribe(subscription_hash.clone(), false)
         .await?;
-    let operation_name = context.operation_name().unwrap_or_default();
     tracing::info!(
         monotonic_counter.apollo.router.operations.subscriptions = 1u64,
         subscriptions.mode = %"passthrough",
@@ -453,7 +491,9 @@ async fn call_websocket(
         subgraph.service.name = service_name,
     );
     if !created {
-        subscription_stream_tx.send(handle.into_stream()).await?;
+        subscription_stream_tx
+            .send(Box::pin(handle.into_stream()))
+            .await?;
         tracing::info!(
             monotonic_counter.apollo_router_deduplicated_subscriptions_total = 1u64,
             mode = %"passthrough",
@@ -482,11 +522,60 @@ async fn call_websocket(
     };
 
     let request = get_websocket_request(service_name.clone(), parts, subgraph_cfg)?;
+
     let display_headers = context.contains_key(LOGGING_DISPLAY_HEADERS);
     let display_body = context.contains_key(LOGGING_DISPLAY_BODY);
+
+    let signing_params = context
+        .extensions()
+        .lock()
+        .get::<SigningParamsConfig>()
+        .cloned();
+
+    let request = if let Some(signing_params) = signing_params {
+        signing_params
+            .sign_empty(request, service_name.as_str())
+            .await?
+    } else {
+        request
+    };
+
+    let subgraph_request_event = context
+        .extensions()
+        .lock()
+        .get::<SubgraphEventRequestLevel>()
+        .cloned();
+    if let Some(level) = subgraph_request_event {
+        let mut attrs = HashMap::with_capacity(5);
+        attrs.insert(
+            "http.request.headers".to_string(),
+            format!("{:?}", request.headers()),
+        );
+        attrs.insert(
+            "http.request.method".to_string(),
+            format!("{}", request.method()),
+        );
+        attrs.insert(
+            "http.request.version".to_string(),
+            format!("{:?}", request.version()),
+        );
+        attrs.insert(
+            "http.request.body".to_string(),
+            serde_json::to_string(request.body()).unwrap_or_default(),
+        );
+        attrs.insert("subgraph.name".to_string(), service_name.to_string());
+        log_event(
+            level.0,
+            "subgraph.request",
+            attrs,
+            &format!("Websocket request body to subgraph {service_name:?}"),
+        );
+    }
+
     if display_headers {
         tracing::info!(http.request.headers = ?request.headers(), apollo.subgraph.name = %service_name, "Websocket request headers to subgraph {service_name:?}");
     }
+
     if display_body {
         tracing::info!(http.request.body = ?request.body(), apollo.subgraph.name = %service_name, "Websocket request body to subgraph {service_name:?}");
     }
@@ -518,24 +607,34 @@ async fn call_websocket(
 
     let (ws_stream, mut resp) = match request.uri().scheme_str() {
         Some("wss") => {
-            connect_async_tls_with_config(request, None, None)
+            connect_async_tls_with_config(request, None, false, None)
                 .instrument(subgraph_req_span)
                 .await
         }
         _ => connect_async(request).instrument(subgraph_req_span).await,
     }
-    .map_err(|err| FetchError::SubrequestWsError {
-        service: service_name.clone(),
-        reason: format!("cannot connect websocket to subgraph: {err}"),
+    .map_err(|err| {
+        if display_body || display_headers {
+            tracing::info!(
+                http.response.error = format!("{:?}", &err), apollo.subgraph.name = %service_name, "Websocket connection error from subgraph {service_name:?} received"
+            );
+        }
+        FetchError::SubrequestWsError {
+            service: service_name.clone(),
+            reason: format!("cannot connect websocket to subgraph: {err}"),
+        }
     })?;
 
+    if display_headers {
+        tracing::info!(response.headers = ?resp.headers(), apollo.subgraph.name = %service_name, "Websocket response headers to subgraph {service_name:?}");
+    }
     if display_body {
         tracing::info!(
-            response.body = %String::from_utf8_lossy(&resp.body_mut().take().unwrap_or_default()), apollo.subgraph.name = %service_name, "Raw response body from subgraph {service_name:?} received"
+            response.body = %String::from_utf8_lossy(&resp.body_mut().take().unwrap_or_default()), apollo.subgraph.name = %service_name, "Websocket response body from subgraph {service_name:?} received"
         );
     }
 
-    let mut gql_stream = GraphqlWebSocket::new(
+    let gql_socket = GraphqlWebSocket::new(
         convert_websocket_stream(ws_stream, subscription_hash.clone()),
         subscription_hash,
         subgraph_cfg.protocol,
@@ -547,14 +646,14 @@ async fn call_websocket(
         reason: "cannot get the GraphQL websocket stream".to_string(),
     })?;
 
-    gql_stream
-        .send(body)
+    let gql_stream = gql_socket
+        .into_subscription(body, subgraph_cfg.heartbeat_interval.into_option())
         .await
         .map_err(|err| FetchError::SubrequestWsError {
             service: service_name,
             reason: format!("cannot send the subgraph request to websocket stream: {err:?}"),
         })?;
-    let (mut gql_sink, gql_stream) = gql_stream.split();
+
     let (handle_sink, handle_stream) = handle.split();
 
     tokio::task::spawn(async move {
@@ -562,13 +661,9 @@ async fn call_websocket(
             .map(Ok::<_, graphql::Error>)
             .forward(handle_sink)
             .await;
-
-        if let Err(err) = gql_sink.close().await {
-            tracing::trace!("cannot close the websocket stream: {err:?}");
-        }
     });
 
-    subscription_stream_tx.send(handle_stream).await?;
+    subscription_stream_tx.send(Box::pin(handle_stream)).await?;
 
     Ok(SubgraphResponse::new_from_response(
         resp.map(|_| graphql::Response::default()),
@@ -576,53 +671,10 @@ async fn call_websocket(
     ))
 }
 
-/// call_http makes http calls with modified graphql::Request (body)
-async fn call_http(
-    request: SubgraphRequest,
-    body: graphql::Request,
-    context: Context,
-    client: Decompression<Client<HttpsConnector<HttpConnector>>>,
-    service_name: &str,
-) -> Result<SubgraphResponse, BoxError> {
-    let SubgraphRequest {
-        subgraph_request, ..
-    } = request;
-
-    let operation_name = subgraph_request
-        .body()
-        .operation_name
-        .clone()
-        .unwrap_or_default();
-    let (parts, _) = subgraph_request.into_parts();
-
-    let body = serde_json::to_string(&body).expect("JSON serialization should not fail");
-    let compressed_body = compress(body, &parts.headers)
-        .instrument(tracing::debug_span!("body_compression"))
-        .await
-        .map_err(|err| {
-            tracing::error!(compress_error = format!("{err:?}").as_str());
-
-            FetchError::CompressionError {
-                service: service_name.to_string(),
-                reason: err.to_string(),
-            }
-        })?;
-
-    let mut request = http::request::Request::from_parts(parts, compressed_body.into());
-    let app_json: HeaderValue = HeaderValue::from_static(APPLICATION_JSON.essence_str());
-    let app_graphql_json: HeaderValue =
-        HeaderValue::from_static(GRAPHQL_JSON_RESPONSE_HEADER_VALUE);
-    request.headers_mut().insert(CONTENT_TYPE, app_json.clone());
-    request.headers_mut().insert(ACCEPT, app_json);
-    request.headers_mut().append(ACCEPT, app_graphql_json);
-    request
-        .headers_mut()
-        .insert(ACCEPT_ENCODING, ACCEPTED_ENCODINGS);
-
-    let schema_uri = request.uri();
-    let host = schema_uri.host().unwrap_or_default();
-    let port = schema_uri.port_u16().unwrap_or_else(|| {
-        let scheme = schema_uri.scheme_str();
+// Utility function to extract uri details.
+fn get_uri_details(uri: &hyper::Uri) -> (&str, u16, &str) {
+    let port = uri.port_u16().unwrap_or_else(|| {
+        let scheme = uri.scheme_str();
         if scheme == Some("https") {
             443
         } else if scheme == Some("http") {
@@ -632,62 +684,16 @@ async fn call_http(
         }
     });
 
-    let path = schema_uri.path();
+    (uri.host().unwrap_or_default(), port, uri.path())
+}
 
-    let subgraph_req_span = tracing::info_span!("subgraph_request",
-        "otel.kind" = "CLIENT",
-        "net.peer.name" = %host,
-        "net.peer.port" = %port,
-        "http.route" = %path,
-        "http.url" = %schema_uri,
-        "net.transport" = "ip_tcp",
-        "apollo.subgraph.name" = %service_name,
-        "graphql.operation.name" = %operation_name,
-    );
-    get_text_map_propagator(|propagator| {
-        propagator.inject_context(
-            &subgraph_req_span.context(),
-            &mut opentelemetry_http::HeaderInjector(request.headers_mut()),
-        );
-    });
-
-    // The graphql spec is lax about what strategy to use for processing responses: https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md#processing-the-response
-    //
-    // "If the response uses a non-200 status code and the media type of the response payload is application/json
-    // then the client MUST NOT rely on the body to be a well-formed GraphQL response since the source of the response
-    // may not be the server but instead some intermediary such as API gateways, proxies, firewalls, etc."
-    //
-    // The TLDR of this is that it's really asking us to do the best we can with whatever information we have with some modifications depending on content type.
-    // Our goal is to give the user the most relevant information possible in the response errors
-    //
-    // Rules:
-    // 1. If the content type of the response is not `application/json` or `application/graphql-response+json` then we won't try to parse.
-    // 2. If an HTTP status is not 2xx it will always be attached as a graphql error.
-    // 3. If the response type is `application/json` and status is not 2xx and the body the entire body will be output if the response is not valid graphql.
-
-    let display_headers = context.contains_key(LOGGING_DISPLAY_HEADERS);
-    let display_body = context.contains_key(LOGGING_DISPLAY_BODY);
-
-    // Print out the debug for the request
-    if display_headers {
-        tracing::info!(http.request.headers = ?request.headers(), apollo.subgraph.name = %service_name, "Request headers to subgraph {service_name:?}");
-    }
-    if display_body {
-        tracing::info!(http.request.body = ?request.body(), apollo.subgraph.name = %service_name, "Request body to subgraph {service_name:?}");
-    }
-
-    // Perform the actual fetch. If this fails then we didn't manage to make the call at all, so we can't do anything with it.
-    let (parts, content_type, body) = do_fetch(
-        client,
-        &context,
-        service_name,
-        request,
-        display_headers,
-        display_body,
-    )
-    .instrument(subgraph_req_span)
-    .await?;
-
+// Utility function to create a graphql response from HTTP response components
+fn http_response_to_graphql_response(
+    service_name: &str,
+    content_type: Result<ContentType, FetchError>,
+    body: Option<Result<Bytes, FetchError>>,
+    parts: &Parts,
+) -> graphql::Response {
     let mut graphql_response = match (content_type, body, parts.status.is_success()) {
         (Ok(ContentType::ApplicationGraphqlResponseJson), Some(Ok(body)), _)
         | (Ok(ContentType::ApplicationJson), Some(Ok(body)), true) => {
@@ -754,11 +760,510 @@ async fn call_http(
             .to_graphql_error(None),
         )
     }
+    graphql_response
+}
+
+/// Process a single subgraph batch request
+#[instrument(skip(client_factory, context, request))]
+pub(crate) async fn process_batch(
+    client_factory: HttpClientServiceFactory,
+    service: String,
+    context: Context,
+    mut request: http::Request<hyper::Body>,
+    listener_count: usize,
+) -> Result<Vec<SubgraphResponse>, FetchError> {
+    // Now we need to "batch up" our data and send it to our subgraphs
+    request
+        .headers_mut()
+        .insert(CONTENT_TYPE, APPLICATION_JSON_HEADER_VALUE.clone());
+    request
+        .headers_mut()
+        .append(ACCEPT, ACCEPT_GRAPHQL_JSON.clone());
+
+    let schema_uri = request.uri();
+    let (host, port, path) = get_uri_details(schema_uri);
+
+    // We can't provide a single operation name in the span (since we may be processing multiple
+    // operations). Product decision, use the hard coded value "batch".
+    let subgraph_req_span = tracing::info_span!("subgraph_request",
+        "otel.kind" = "CLIENT",
+        "net.peer.name" = %host,
+        "net.peer.port" = %port,
+        "http.route" = %path,
+        "http.url" = %schema_uri,
+        "net.transport" = "ip_tcp",
+        "apollo.subgraph.name" = %&service,
+        "graphql.operation.name" = "batch"
+    );
+
+    // The graphql spec is lax about what strategy to use for processing responses: https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md#processing-the-response
+    //
+    // "If the response uses a non-200 status code and the media type of the response payload is application/json
+    // then the client MUST NOT rely on the body to be a well-formed GraphQL response since the source of the response
+    // may not be the server but instead some intermediary such as API gateways, proxies, firewalls, etc."
+    //
+    // The TLDR of this is that it's really asking us to do the best we can with whatever information we have with some modifications depending on content type.
+    // Our goal is to give the user the most relevant information possible in the response errors
+    //
+    // Rules:
+    // 1. If the content type of the response is not `application/json` or `application/graphql-response+json` then we won't try to parse.
+    // 2. If an HTTP status is not 2xx it will always be attached as a graphql error.
+    // 3. If the response type is `application/json` and status is not 2xx and the body the entire body will be output if the response is not valid graphql.
+
+    let display_body = context.contains_key(LOGGING_DISPLAY_BODY);
+    let client = client_factory.create(&service);
+
+    // Update our batching metrics (just before we fetch)
+    tracing::info!(histogram.apollo.router.operations.batching.size = listener_count as f64,
+        mode = %BatchingMode::BatchHttpLink, // Only supported mode right now
+        subgraph = &service
+    );
+
+    tracing::info!(monotonic_counter.apollo.router.operations.batching = 1u64,
+        mode = %BatchingMode::BatchHttpLink, // Only supported mode right now
+        subgraph = &service
+    );
+
+    // Perform the actual fetch. If this fails then we didn't manage to make the call at all, so we can't do anything with it.
+    tracing::debug!("fetching from subgraph: {service}");
+    let (parts, content_type, body) = do_fetch(client, &context, &service, request, display_body)
+        .instrument(subgraph_req_span)
+        .await?;
+
+    let subgraph_response_event = context
+        .extensions()
+        .lock()
+        .get::<SubgraphEventResponseLevel>()
+        .cloned();
+    if let Some(level) = subgraph_response_event {
+        let mut attrs = HashMap::with_capacity(5);
+        attrs.insert(
+            "http.response.headers".to_string(),
+            format!("{:?}", parts.headers),
+        );
+        attrs.insert(
+            "http.response.status".to_string(),
+            format!("{}", parts.status),
+        );
+        attrs.insert(
+            "http.response.version".to_string(),
+            format!("{:?}", parts.version),
+        );
+        if let Some(Ok(b)) = &body {
+            attrs.insert(
+                "http.response.body".to_string(),
+                String::from_utf8_lossy(b).to_string(),
+            );
+        }
+        attrs.insert("subgraph.name".to_string(), service.clone());
+        log_event(
+            level.0,
+            "subgraph.response",
+            attrs,
+            &format!("Raw response from subgraph {service:?} received"),
+        );
+    }
+
+    if display_body {
+        if let Some(Ok(b)) = &body {
+            tracing::info!(
+            response.body = %String::from_utf8_lossy(b), apollo.subgraph.name = %&service, "Raw response body from subgraph {service:?} received"
+            );
+        }
+    }
+
+    tracing::debug!("parts: {parts:?}, content_type: {content_type:?}, body: {body:?}");
+    let value =
+        serde_json::from_slice(&body.ok_or(FetchError::SubrequestMalformedResponse {
+            service: service.to_string(),
+            reason: "no body in response".to_string(),
+        })??)
+        .map_err(|error| FetchError::SubrequestMalformedResponse {
+            service: service.to_string(),
+            reason: error.to_string(),
+        })?;
+
+    tracing::debug!("json value from body is: {value:?}");
+
+    let array = ensure_array!(value).map_err(|error| FetchError::SubrequestMalformedResponse {
+        service: service.to_string(),
+        reason: error.to_string(),
+    })?;
+    let mut graphql_responses = Vec::with_capacity(array.len());
+    for value in array {
+        let object =
+            ensure_object!(value).map_err(|error| FetchError::SubrequestMalformedResponse {
+                service: service.to_string(),
+                reason: error.to_string(),
+            })?;
+
+        // Map our Vec<u8> into Bytes
+        // Map our serde conversion error to a FetchError
+        let body = Some(
+            serde_json::to_vec(&object)
+                .map(|v| v.into())
+                .map_err(|error| FetchError::SubrequestMalformedResponse {
+                    service: service.to_string(),
+                    reason: error.to_string(),
+                }),
+        );
+
+        let graphql_response =
+            http_response_to_graphql_response(&service, content_type.clone(), body, &parts);
+        graphql_responses.push(graphql_response);
+    }
+
+    tracing::debug!("we have a vec of graphql_responses: {graphql_responses:?}");
+    // Build an http Response for each graphql response
+    let subgraph_responses: Result<Vec<_>, _> = graphql_responses
+        .into_iter()
+        .map(|res| {
+            http::Response::builder()
+                .status(parts.status)
+                .version(parts.version)
+                .body(res)
+                .map(|mut http_res| {
+                    *http_res.headers_mut() = parts.headers.clone();
+                    let resp = SubgraphResponse::new_from_response(http_res, context.clone());
+
+                    tracing::debug!("we have a resp: {resp:?}");
+                    resp
+                })
+                .map_err(|e| FetchError::MalformedResponse {
+                    reason: e.to_string(),
+                })
+        })
+        .collect();
+
+    tracing::debug!("we have a vec of subgraph_responses: {subgraph_responses:?}");
+    subgraph_responses
+}
+
+/// Notify all listeners of a batch query of the results
+pub(crate) async fn notify_batch_query(
+    service: String,
+    senders: Vec<oneshot::Sender<Result<SubgraphResponse, BoxError>>>,
+    responses: Result<Vec<SubgraphResponse>, FetchError>,
+) -> Result<(), BoxError> {
+    tracing::debug!(
+        "handling response for service '{service}' with {} listeners: {responses:#?}",
+        senders.len()
+    );
+
+    match responses {
+        // If we had an error processing the batch, then pipe that error to all of the listeners
+        Err(e) => {
+            for tx in senders {
+                // Try to notify all waiters. If we can't notify an individual sender, then log an error
+                if let Err(log_error) = tx.send(Err(Box::new(e.clone()))).map_err(|error| {
+                    FetchError::SubrequestBatchingError {
+                        service: service.clone(),
+                        reason: format!("tx send failed: {error:?}"),
+                    }
+                }) {
+                    tracing::error!(service, error=%log_error, "failed to notify sender that batch processing failed");
+                }
+            }
+        }
+
+        Ok(rs) => {
+            // Before we process our graphql responses, ensure that we have a tx for each
+            // response
+            if senders.len() != rs.len() {
+                return Err(Box::new(FetchError::SubrequestBatchingError {
+                    service,
+                    reason: format!(
+                        "number of txs ({}) is not equal to number of graphql responses ({})",
+                        senders.len(),
+                        rs.len()
+                    ),
+                }));
+            }
+
+            // We have checked before we started looping that we had a tx for every
+            // graphql_response, so zip_eq shouldn't panic.
+            // Use the tx to send a graphql_response message to each waiter.
+            for (response, sender) in rs.into_iter().zip_eq(senders) {
+                if let Err(log_error) =
+                    sender
+                        .send(Ok(response))
+                        .map_err(|error| FetchError::SubrequestBatchingError {
+                            service: service.to_string(),
+                            reason: format!("tx send failed: {error:?}"),
+                        })
+                {
+                    tracing::error!(service, error=%log_error, "failed to notify sender that batch processing succeeded");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+type BatchInfo = (
+    (String, http::Request<Body>, Context, usize),
+    Vec<oneshot::Sender<Result<SubgraphResponse, BoxError>>>,
+);
+
+/// Collect all batch requests and process them concurrently
+#[instrument(skip_all)]
+pub(crate) async fn process_batches(
+    client_factory: HttpClientServiceFactory,
+    svc_map: HashMap<String, Vec<BatchQueryInfo>>,
+) -> Result<(), BoxError> {
+    // We need to strip out the senders so that we can work with them separately.
+    let mut errors = vec![];
+    let (info, txs): (Vec<_>, Vec<_>) =
+        futures::future::join_all(svc_map.into_iter().map(|(service, requests)| async {
+            let (_op_name, context, request, txs) = assemble_batch(requests).await?;
+
+            Ok(((service, request, context, txs.len()), txs))
+        }))
+        .await
+        .into_iter()
+        .filter_map(|x: Result<BatchInfo, BoxError>| x.map_err(|e| errors.push(e)).ok())
+        .unzip();
+
+    // If errors isn't empty, then process_batches cannot proceed. Let's log out the errors and
+    // return
+    if !errors.is_empty() {
+        for error in errors {
+            tracing::error!("assembling batch failed: {error}");
+        }
+        return Err(SubgraphBatchingError::ProcessingFailed(
+            "assembling batches failed".to_string(),
+        )
+        .into());
+    }
+    // Collect all of the processing logic and run them concurrently, collecting all errors
+    let cf = &client_factory;
+    // It is not ok to panic if the length of the txs and info do not match. Let's make sure they
+    // do
+    if txs.len() != info.len() {
+        return Err(SubgraphBatchingError::ProcessingFailed(
+            "length of txs and info are not equal".to_string(),
+        )
+        .into());
+    }
+    let batch_futures = info.into_iter().zip_eq(txs).map(
+        |((service, request, context, listener_count), senders)| async move {
+            let batch_result = process_batch(
+                cf.clone(),
+                service.clone(),
+                context,
+                request,
+                listener_count,
+            )
+            .await;
+
+            notify_batch_query(service, senders, batch_result).await
+        },
+    );
+
+    futures::future::try_join_all(batch_futures).await?;
+
+    Ok(())
+}
+
+async fn call_http(
+    request: SubgraphRequest,
+    body: graphql::Request,
+    context: Context,
+    client_factory: HttpClientServiceFactory,
+    service_name: &str,
+) -> Result<SubgraphResponse, BoxError> {
+    // We use configuration to determine if calls may be batched. If we have Batching
+    // configuration, then we check (batch_include()) if the current subgraph has batching enabled
+    // in configuration. If it does, we then start to process a potential batch.
+    //
+    // If we are processing a batch, then we'd like to park tasks here, but we can't park them whilst
+    // we have the context extensions lock held. That would be very bad...
+    // We grab the (potential) BatchQuery and then operate on it later
+    let opt_batch_query = {
+        let extensions_guard = context.extensions().lock();
+
+        // We need to make sure to remove the BatchQuery from the context as it holds a sender to
+        // the owning batch
+        extensions_guard
+            .get::<Batching>()
+            .and_then(|batching_config| batching_config.batch_include(service_name).then_some(()))
+            .and_then(|_| extensions_guard.get::<BatchQuery>().cloned())
+            .and_then(|bq| (!bq.finished()).then_some(bq))
+    };
+
+    // If we have a batch query, then it's time for batching
+    if let Some(query) = opt_batch_query {
+        // Let the owning batch know that this query is ready to process, getting back the channel
+        // from which we'll eventually receive our response.
+        let response_rx = query.signal_progress(client_factory, request, body).await?;
+
+        // Park this query until we have our response and pass it back up
+        response_rx
+            .await
+            .map_err(|err| FetchError::SubrequestBatchingError {
+                service: service_name.to_string(),
+                reason: format!("tx receive failed: {err}"),
+            })?
+    } else {
+        tracing::debug!("we called http");
+        let client = client_factory.create(service_name);
+        call_single_http(request, body, context, client, service_name).await
+    }
+}
+
+/// call_single_http makes http calls with modified graphql::Request (body)
+pub(crate) async fn call_single_http(
+    request: SubgraphRequest,
+    body: graphql::Request,
+    context: Context,
+    client: crate::services::http::BoxService,
+    service_name: &str,
+) -> Result<SubgraphResponse, BoxError> {
+    let SubgraphRequest {
+        subgraph_request, ..
+    } = request;
+
+    let operation_name = subgraph_request
+        .body()
+        .operation_name
+        .clone()
+        .unwrap_or_default();
+
+    let (parts, _) = subgraph_request.into_parts();
+    let body = serde_json::to_string(&body)?;
+    tracing::debug!("our JSON body: {body:?}");
+    let mut request = http::Request::from_parts(parts, Body::from(body));
+
+    request
+        .headers_mut()
+        .insert(CONTENT_TYPE, APPLICATION_JSON_HEADER_VALUE.clone());
+    request
+        .headers_mut()
+        .append(ACCEPT, ACCEPT_GRAPHQL_JSON.clone());
+
+    let schema_uri = request.uri();
+    let (host, port, path) = get_uri_details(schema_uri);
+
+    let subgraph_req_span = tracing::info_span!("subgraph_request",
+        "otel.kind" = "CLIENT",
+        "net.peer.name" = %host,
+        "net.peer.port" = %port,
+        "http.route" = %path,
+        "http.url" = %schema_uri,
+        "net.transport" = "ip_tcp",
+        "apollo.subgraph.name" = %service_name,
+        "graphql.operation.name" = %operation_name,
+    );
+
+    // The graphql spec is lax about what strategy to use for processing responses: https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md#processing-the-response
+    //
+    // "If the response uses a non-200 status code and the media type of the response payload is application/json
+    // then the client MUST NOT rely on the body to be a well-formed GraphQL response since the source of the response
+    // may not be the server but instead some intermediary such as API gateways, proxies, firewalls, etc."
+    //
+    // The TLDR of this is that it's really asking us to do the best we can with whatever information we have with some modifications depending on content type.
+    // Our goal is to give the user the most relevant information possible in the response errors
+    //
+    // Rules:
+    // 1. If the content type of the response is not `application/json` or `application/graphql-response+json` then we won't try to parse.
+    // 2. If an HTTP status is not 2xx it will always be attached as a graphql error.
+    // 3. If the response type is `application/json` and status is not 2xx and the body the entire body will be output if the response is not valid graphql.
+
+    let display_body = context.contains_key(LOGGING_DISPLAY_BODY);
+
+    // TODO: Temporary solution to plug FileUploads plugin until 'http_client' will be fixed https://github.com/apollographql/router/pull/4666
+    let request = file_uploads::http_request_wrapper(request).await;
+
+    let subgraph_request_event = context
+        .extensions()
+        .lock()
+        .get::<SubgraphEventRequestLevel>()
+        .cloned();
+    if let Some(level) = subgraph_request_event {
+        let mut attrs = HashMap::with_capacity(5);
+        attrs.insert(
+            "http.request.headers".to_string(),
+            format!("{:?}", request.headers()),
+        );
+        attrs.insert(
+            "http.request.method".to_string(),
+            format!("{}", request.method()),
+        );
+        attrs.insert(
+            "http.request.version".to_string(),
+            format!("{:?}", request.version()),
+        );
+        attrs.insert(
+            "http.request.body".to_string(),
+            format!("{:?}", request.body()),
+        );
+        attrs.insert("subgraph.name".to_string(), service_name.to_string());
+
+        log_event(
+            level.0,
+            "subgraph.request",
+            attrs,
+            &format!("Request to subgraph {service_name:?}"),
+        );
+    }
+
+    // Perform the actual fetch. If this fails then we didn't manage to make the call at all, so we can't do anything with it.
+    let (parts, content_type, body) =
+        do_fetch(client, &context, service_name, request, display_body)
+            .instrument(subgraph_req_span)
+            .await?;
+
+    let subgraph_response_event = context
+        .extensions()
+        .lock()
+        .get::<SubgraphEventResponseLevel>()
+        .cloned();
+    if let Some(level) = subgraph_response_event {
+        let mut attrs = HashMap::with_capacity(5);
+        attrs.insert(
+            "http.response.headers".to_string(),
+            format!("{:?}", parts.headers),
+        );
+        attrs.insert(
+            "http.response.status".to_string(),
+            format!("{}", parts.status),
+        );
+        attrs.insert(
+            "http.response.version".to_string(),
+            format!("{:?}", parts.version),
+        );
+        if let Some(Ok(b)) = &body {
+            attrs.insert(
+                "http.response.body".to_string(),
+                String::from_utf8_lossy(b).to_string(),
+            );
+        }
+        attrs.insert("subgraph.name".to_string(), service_name.to_string());
+        log_event(
+            level.0,
+            "subgraph.response",
+            attrs,
+            &format!("Raw response from subgraph {service_name:?} received"),
+        );
+    }
+
+    if display_body {
+        if let Some(Ok(b)) = &body {
+            tracing::info!(
+                response.body = %String::from_utf8_lossy(b), apollo.subgraph.name = %service_name, "Raw response body from subgraph {service_name:?} received"
+            );
+        }
+    }
+
+    let graphql_response =
+        http_response_to_graphql_response(service_name, content_type, body, &parts);
 
     let resp = http::Response::from_parts(parts, graphql_response);
     Ok(SubgraphResponse::new_from_response(resp, context))
 }
 
+#[derive(Clone, Debug)]
 enum ContentType {
     ApplicationJson,
     ApplicationGraphqlResponseJson,
@@ -799,11 +1304,10 @@ fn get_graphql_content_type(service_name: &str, parts: &Parts) -> Result<Content
 }
 
 async fn do_fetch(
-    mut client: Decompression<Client<HttpsConnector<HttpConnector>>>,
+    mut client: crate::services::http::BoxService,
     context: &Context,
     service_name: &str,
     request: Request<Body>,
-    display_headers: bool,
     display_body: bool,
 ) -> Result<
     (
@@ -815,7 +1319,10 @@ async fn do_fetch(
 > {
     let _active_request_guard = context.enter_active_request();
     let response = client
-        .call(request)
+        .call(HttpRequest {
+            http_request: request,
+            context: context.clone(),
+        })
         .map_err(|err| {
             tracing::error!(fetch_error = ?err);
             FetchError::SubrequestHttpError {
@@ -826,13 +1333,8 @@ async fn do_fetch(
         })
         .await?;
 
-    let (parts, body) = response.into_parts();
-    // Print out debug for the response
-    if display_headers {
-        tracing::info!(
-            http.response.headers = ?parts.headers, apollo.subgraph.name = %service_name, "Response headers from subgraph {service_name:?}"
-        );
-    }
+    let (parts, body) = response.http_response.into_parts();
+
     let content_type = get_graphql_content_type(service_name, &parts);
 
     let body = if content_type.is_ok() {
@@ -856,6 +1358,24 @@ async fn do_fetch(
         }
         Some(body)
     } else {
+        if display_body {
+            let body = hyper::body::to_bytes(body)
+                .instrument(tracing::debug_span!("aggregate_response_data"))
+                .await
+                .map_err(|err| {
+                    tracing::error!(fetch_error = ?err);
+                    FetchError::SubrequestHttpError {
+                        status_code: Some(parts.status.as_u16()),
+                        service: service_name.to_string(),
+                        reason: err.to_string(),
+                    }
+                });
+            if let Ok(body) = &body {
+                tracing::info!(
+                    http.response.body = %String::from_utf8_lossy(body), apollo.subgraph.name = %service_name, "Raw response body from subgraph {service_name:?} received"
+                );
+            }
+        }
         None
     };
     Ok((parts, content_type, body))
@@ -938,43 +1458,6 @@ fn get_apq_error(gql_response: &graphql::Response) -> APQError {
     APQError::Other
 }
 
-pub(crate) async fn compress(body: String, headers: &HeaderMap) -> Result<Vec<u8>, BoxError> {
-    let content_encoding = headers.get(&CONTENT_ENCODING);
-    match content_encoding {
-        Some(content_encoding) => match content_encoding.to_str()? {
-            "br" => {
-                let mut br_encoder = BrotliEncoder::new(Vec::new());
-                br_encoder.write_all(body.as_bytes()).await?;
-                br_encoder.shutdown().await?;
-
-                Ok(br_encoder.into_inner())
-            }
-            "gzip" => {
-                let mut gzip_encoder = GzipEncoder::new(Vec::new());
-                gzip_encoder.write_all(body.as_bytes()).await?;
-                gzip_encoder.shutdown().await?;
-
-                Ok(gzip_encoder.into_inner())
-            }
-            "deflate" => {
-                let mut df_encoder = ZlibEncoder::new(Vec::new());
-                df_encoder.write_all(body.as_bytes()).await?;
-                df_encoder.shutdown().await?;
-
-                Ok(df_encoder.into_inner())
-            }
-            "identity" => Ok(body.into_bytes()),
-            unknown => {
-                tracing::error!("unknown content-encoding value '{:?}'", unknown);
-                Err(BoxError::from(format!(
-                    "unknown content-encoding value '{unknown:?}'",
-                )))
-            }
-        },
-        None => Ok(body.into_bytes()),
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct SubgraphServiceFactory {
     pub(crate) services: Arc<HashMap<String, Arc<dyn MakeSubgraphService>>>,
@@ -1042,7 +1525,6 @@ mod tests {
     use axum::Router;
     use axum::Server;
     use bytes::Buf;
-    use futures::channel::mpsc;
     use futures::StreamExt;
     use http::header::HOST;
     use http::StatusCode;
@@ -1051,6 +1533,8 @@ mod tests {
     use hyper::Body;
     use serde_json_bytes::ByteString;
     use serde_json_bytes::Value;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
     use tower::service_fn;
     use tower::ServiceExt;
     use url::Url;
@@ -1060,9 +1544,11 @@ mod tests {
     use crate::graphql::Error;
     use crate::graphql::Request;
     use crate::graphql::Response;
+    use crate::plugins::subscription::HeartbeatInterval;
     use crate::plugins::subscription::SubgraphPassthroughMode;
     use crate::plugins::subscription::SubscriptionModeConfig;
     use crate::plugins::subscription::SUBSCRIPTION_CALLBACK_HMAC_KEY;
+    use crate::plugins::traffic_shaping::Http2Config;
     use crate::protocols::websocket::ClientMessage;
     use crate::protocols::websocket::ServerMessage;
     use crate::protocols::websocket::WebSocketProtocol;
@@ -1195,53 +1681,6 @@ mod tests {
                 .header(CONTENT_TYPE, "text/html")
                 .status(StatusCode::OK)
                 .body(r#"TEST"#.into())
-                .unwrap())
-        }
-
-        let make_svc = make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(handle)) });
-        let server = Server::from_tcp(listener).unwrap().serve(make_svc);
-        server.await.unwrap();
-    }
-
-    // starts a local server emulating a subgraph returning compressed response
-    async fn emulate_subgraph_compressed_response(listener: TcpListener) {
-        async fn handle(request: http::Request<Body>) -> Result<http::Response<Body>, Infallible> {
-            // Check the compression of the body
-            let mut encoder = GzipEncoder::new(Vec::new());
-            encoder
-                .write_all(
-                    &serde_json::to_vec(&Request::builder().query("query".to_string()).build())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            encoder.shutdown().await.unwrap();
-            let compressed_body = encoder.into_inner();
-            assert_eq!(
-                compressed_body,
-                hyper::body::to_bytes(request.into_body())
-                    .await
-                    .unwrap()
-                    .to_vec()
-            );
-
-            let original_body = Response {
-                data: Some(Value::String(ByteString::from("test"))),
-                ..Response::default()
-            };
-            let mut encoder = GzipEncoder::new(Vec::new());
-            encoder
-                .write_all(&serde_json::to_vec(&original_body).unwrap())
-                .await
-                .unwrap();
-            encoder.shutdown().await.unwrap();
-            let compressed_body = encoder.into_inner();
-
-            Ok(http::Response::builder()
-                .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                .header(CONTENT_ENCODING, "gzip")
-                .status(StatusCode::OK)
-                .body(compressed_body.into())
                 .unwrap())
         }
 
@@ -1635,7 +2074,12 @@ mod tests {
 
     async fn emulate_subgraph_with_callback_data(listener: TcpListener) {
         async fn handle(request: http::Request<Body>) -> Result<http::Response<Body>, Infallible> {
-            let (_, body) = request.into_parts();
+            let (parts, body) = request.into_parts();
+            assert!(parts
+                .headers
+                .get_all(ACCEPT)
+                .iter()
+                .any(|header_value| header_value == CALLBACK_PROTOCOL_ACCEPT));
             let graphql_request: Result<graphql::Request, &str> = hyper::body::to_bytes(body)
                 .await
                 .map_err(|_| ())
@@ -1658,6 +2102,7 @@ mod tests {
                     subscription_extension.subscription_id
                 )
             );
+            assert_eq!(subscription_extension.heartbeat_interval_ms, 0);
 
             Ok(http::Response::builder()
                 .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
@@ -1680,10 +2125,11 @@ mod tests {
             enabled: true,
             mode: SubscriptionModeConfig {
                 callback: Some(CallbackMode {
-                    public_url: Url::parse("http://localhost:4000").unwrap(),
+                    public_url: Url::parse("http://localhost:4000/testcallback").unwrap(),
                     listen: None,
                     path: Some("/testcallback".to_string()),
                     subgraphs: vec![String::from("testbis")].into_iter().collect(),
+                    heartbeat_interval: HeartbeatInterval::new_disabled(),
                 }),
                 passthrough: Some(SubgraphPassthroughMode {
                     all: None,
@@ -1692,6 +2138,7 @@ mod tests {
                         WebSocketConfiguration {
                             path: Some(String::from("/ws")),
                             protocol: WebSocketProtocol::default(),
+                            heartbeat_interval: HeartbeatInterval::new_disabled(),
                         },
                     )]
                     .into(),
@@ -1703,6 +2150,25 @@ mod tests {
         }
     }
 
+    fn supergraph_request(query: &str) -> Arc<http::Request<Request>> {
+        Arc::new(
+            http::Request::builder()
+                .header(HOST, "host")
+                .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
+                .body(Request::builder().query(query).build())
+                .expect("expecting valid request"),
+        )
+    }
+
+    fn subgraph_http_request(uri: Uri, query: &str) -> http::Request<Request> {
+        http::Request::builder()
+            .header(HOST, "rhost")
+            .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
+            .uri(uri)
+            .body(Request::builder().query(query).build())
+            .expect("expecting valid request")
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_subgraph_service_callback() {
         let _ = SUBSCRIPTION_CALLBACK_HMAC_KEY.set(String::from("TESTEST"));
@@ -1712,41 +2178,33 @@ mod tests {
         let subgraph_service = SubgraphService::new(
             "testbis",
             true,
-            None,
-            false,
             subscription_config().into(),
             Notify::builder().build(),
-        );
+            HttpClientServiceFactory::from_config(
+                "testbis",
+                &Configuration::default(),
+                Http2Config::Disable,
+            ),
+        )
+        .expect("can create a SubgraphService");
         let (tx, _rx) = mpsc::channel(2);
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(
-                            Request::builder()
-                                .query("subscription {\n  userWasCreated {\n    username\n  }\n}")
-                                .build(),
-                        )
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(
-                        Request::builder()
-                            .query("subscription {\n  userWasCreated {\n    username\n  }\n}")
-                            .build(),
-                    )
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Subscription,
-                context: Context::new(),
-                subscription_stream: Some(tx),
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request(
+                        "subscription {\n  userWasCreated {\n    username\n  }\n}",
+                    ))
+                    .subgraph_request(subgraph_http_request(
+                        url,
+                        "subscription {\n  userWasCreated {\n    username\n  }\n}",
+                    ))
+                    .operation_kind(OperationKind::Subscription)
+                    .subscription_stream(tx)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         response.response.body().errors.iter().for_each(|e| {
@@ -1761,30 +2219,30 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_subgraph_application_graphql_response(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert!(response.response.body().errors.is_empty());
@@ -1795,30 +2253,30 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_subgraph_application_json_response(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert!(response.response.body().errors.is_empty());
@@ -1829,30 +2287,30 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_subgraph_ok_status_invalid_response(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1868,30 +2326,30 @@ mod tests {
         tokio::task::spawn(
             emulate_subgraph_invalid_response_invalid_status_application_json(listener),
         );
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1911,30 +2369,30 @@ mod tests {
         tokio::task::spawn(
             emulate_subgraph_invalid_response_invalid_status_application_graphql(listener),
         );
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1955,47 +2413,40 @@ mod tests {
         let subgraph_service = SubgraphService::new(
             "test",
             true,
-            None,
-            false,
             subscription_config().into(),
             Notify::builder().build(),
-        );
-        let (tx, mut rx) = mpsc::channel(2);
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
+        let (tx, rx) = mpsc::channel(2);
+        let mut rx_stream = ReceiverStream::new(rx);
 
         let url = Uri::from_str(&format!("ws://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(
-                            Request::builder()
-                                .query("subscription {\n  userWasCreated {\n    username\n  }\n}")
-                                .build(),
-                        )
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(
-                        Request::builder()
-                            .query("subscription {\n  userWasCreated {\n    username\n  }\n}")
-                            .build(),
-                    )
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Subscription,
-                context: Context::new(),
-                subscription_stream: Some(tx),
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request(
+                        "subscription {\n  userWasCreated {\n    username\n  }\n}",
+                    ))
+                    .subgraph_request(subgraph_http_request(
+                        url,
+                        "subscription {\n  userWasCreated {\n    username\n  }\n}",
+                    ))
+                    .operation_kind(OperationKind::Subscription)
+                    .subscription_stream(tx)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert!(response.response.body().errors.is_empty());
 
-        let mut gql_stream = rx.next().await.unwrap();
+        let mut gql_stream = rx_stream.next().await.unwrap();
         let message = gql_stream.next().await.unwrap();
         assert_eq!(
             message,
@@ -2015,42 +2466,34 @@ mod tests {
         let subgraph_service = SubgraphService::new(
             "test",
             true,
-            None,
-            false,
             subscription_config().into(),
             Notify::builder().build(),
-        );
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
         let (tx, _rx) = mpsc::channel(2);
 
         let url = Uri::from_str(&format!("ws://{socket_addr}")).unwrap();
         let err = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(
-                            Request::builder()
-                                .query("subscription {\n  userWasCreated {\n    username\n  }\n}")
-                                .build(),
-                        )
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(
-                        Request::builder()
-                            .query("subscription {\n  userWasCreated {\n    username\n  }\n}")
-                            .build(),
-                    )
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Subscription,
-                context: Context::new(),
-                subscription_stream: Some(tx),
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request(
+                        "subscription {\n  userWasCreated {\n    username\n  }\n}",
+                    ))
+                    .subgraph_request(subgraph_http_request(
+                        url,
+                        "subscription {\n  userWasCreated {\n    username\n  }\n}",
+                    ))
+                    .operation_kind(OperationKind::Subscription)
+                    .subscription_stream(tx)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -2064,30 +2507,30 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_subgraph_bad_request(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2106,30 +2549,30 @@ mod tests {
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_subgraph_bad_response_format(listener));
 
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2139,75 +2582,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_compressed_request_response_body() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let socket_addr = listener.local_addr().unwrap();
-        tokio::task::spawn(emulate_subgraph_compressed_response(listener));
-        let subgraph_service =
-            SubgraphService::new("test", false, None, true, None, Notify::default());
-
-        let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
-        let resp = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query".to_string()).build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .header(CONTENT_ENCODING, "gzip")
-                    .uri(url)
-                    .body(Request::builder().query("query".to_string()).build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
-            .await
-            .unwrap();
-        // Test the right decompression of the body
-        let resp_from_subgraph = Response {
-            data: Some(Value::String(ByteString::from("test"))),
-            ..Response::default()
-        };
-
-        assert_eq!(resp.response.body(), &resp_from_subgraph);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn test_unauthorized() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_subgraph_unauthorized(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let response = subgraph_service
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2221,33 +2623,33 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_persisted_query_not_supported_message(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         assert!(subgraph_service.clone().apq.as_ref().load(Relaxed));
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let resp = subgraph_service
             .clone()
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
 
@@ -2267,33 +2669,33 @@ mod tests {
         tokio::task::spawn(emulate_persisted_query_not_supported_extension_code(
             listener,
         ));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         assert!(subgraph_service.clone().apq.as_ref().load(Relaxed));
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let resp = subgraph_service
             .clone()
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
 
@@ -2311,31 +2713,31 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_persisted_query_not_found_message(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let resp = subgraph_service
             .clone()
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
 
@@ -2352,31 +2754,31 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_persisted_query_not_found_extension_code(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let resp = subgraph_service
             .clone()
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
 
@@ -2393,31 +2795,31 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_expected_apq_enabled_configuration(listener));
-        let subgraph_service =
-            SubgraphService::new("test", true, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            true,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let resp = subgraph_service
             .clone()
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
 
@@ -2434,31 +2836,31 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
         tokio::task::spawn(emulate_expected_apq_disabled_configuration(listener));
-        let subgraph_service =
-            SubgraphService::new("test", false, None, true, None, Notify::default());
+        let subgraph_service = SubgraphService::new(
+            "test",
+            false,
+            None,
+            Notify::default(),
+            HttpClientServiceFactory::from_config(
+                "test",
+                &Configuration::default(),
+                Http2Config::Enable,
+            ),
+        )
+        .expect("can create a SubgraphService");
 
         let url = Uri::from_str(&format!("http://{socket_addr}")).unwrap();
         let resp = subgraph_service
             .clone()
-            .oneshot(SubgraphRequest {
-                supergraph_request: Arc::new(
-                    http::Request::builder()
-                        .header(HOST, "host")
-                        .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                        .body(Request::builder().query("query").build())
-                        .expect("expecting valid request"),
-                ),
-                subgraph_request: http::Request::builder()
-                    .header(HOST, "rhost")
-                    .header(CONTENT_TYPE, APPLICATION_JSON.essence_str())
-                    .uri(url)
-                    .body(Request::builder().query("query").build())
-                    .expect("expecting valid request"),
-                operation_kind: OperationKind::Query,
-                context: Context::new(),
-                subscription_stream: None,
-                connection_closed_signal: None,
-            })
+            .oneshot(
+                SubgraphRequest::builder()
+                    .supergraph_request(supergraph_request("query"))
+                    .subgraph_request(subgraph_http_request(url, "query"))
+                    .operation_kind(OperationKind::Query)
+                    .subgraph_name(String::from("test"))
+                    .context(Context::new())
+                    .build(),
+            )
             .await
             .unwrap();
 
@@ -2468,5 +2870,163 @@ mod tests {
         };
 
         assert_eq!(resp.response.body(), &expected_resp);
+    }
+
+    #[test]
+    fn it_gets_uri_details() {
+        let path = "https://example.com/path".parse().unwrap();
+        let (host, port, path) = super::get_uri_details(&path);
+
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+        assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn it_converts_ok_http_to_graphql() {
+        let (parts, body) = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(None)
+            .unwrap()
+            .into_parts();
+        let actual = super::http_response_to_graphql_response(
+            "test_service",
+            Ok(ContentType::ApplicationGraphqlResponseJson),
+            body,
+            &parts,
+        );
+
+        let expected = graphql::Response::builder().build();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn it_converts_error_http_to_graphql() {
+        let (parts, body) = http::Response::builder()
+            .status(StatusCode::IM_A_TEAPOT)
+            .body(None)
+            .unwrap()
+            .into_parts();
+        let actual = super::http_response_to_graphql_response(
+            "test_service",
+            Ok(ContentType::ApplicationGraphqlResponseJson),
+            body,
+            &parts,
+        );
+
+        let expected = graphql::Response::builder()
+            .error(
+                super::FetchError::SubrequestHttpError {
+                    status_code: Some(418),
+                    service: "test_service".into(),
+                    reason: "418: I'm a teapot".into(),
+                }
+                .to_graphql_error(None),
+            )
+            .build();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn it_converts_http_with_body_to_graphql() {
+        let mut json = serde_json::json!({
+            "data": {
+                "some_field": "some_value"
+            }
+        });
+
+        let (parts, body) = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(Some(Ok(Bytes::from(json.to_string()))))
+            .unwrap()
+            .into_parts();
+
+        let actual = super::http_response_to_graphql_response(
+            "test_service",
+            Ok(ContentType::ApplicationGraphqlResponseJson),
+            body,
+            &parts,
+        );
+
+        let expected = graphql::Response::builder()
+            .data(json["data"].take())
+            .build();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn it_converts_http_with_graphql_errors_to_graphql() {
+        let error = graphql::Error::builder()
+            .message("error was encountered for test")
+            .extension_code("SOME_EXTENSION")
+            .build();
+        let mut json = serde_json::json!({
+            "data": {
+                "some_field": "some_value",
+                "error_field": null,
+            },
+            "errors": [error],
+        });
+
+        let (parts, body) = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(Some(Ok(Bytes::from(json.to_string()))))
+            .unwrap()
+            .into_parts();
+
+        let actual = super::http_response_to_graphql_response(
+            "test_service",
+            Ok(ContentType::ApplicationGraphqlResponseJson),
+            body,
+            &parts,
+        );
+
+        let expected = graphql::Response::builder()
+            .data(json["data"].take())
+            .error(error)
+            .build();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn it_converts_error_http_with_graphql_errors_to_graphql() {
+        let error = graphql::Error::builder()
+            .message("error was encountered for test")
+            .extension_code("SOME_EXTENSION")
+            .build();
+        let mut json = serde_json::json!({
+            "data": {
+                "some_field": "some_value",
+                "error_field": null,
+            },
+            "errors": [error],
+        });
+
+        let (parts, body) = http::Response::builder()
+            .status(StatusCode::IM_A_TEAPOT)
+            .body(Some(Ok(Bytes::from(json.to_string()))))
+            .unwrap()
+            .into_parts();
+
+        let actual = super::http_response_to_graphql_response(
+            "test_service",
+            Ok(ContentType::ApplicationGraphqlResponseJson),
+            body,
+            &parts,
+        );
+
+        let expected = graphql::Response::builder()
+            .data(json["data"].take())
+            .error(
+                super::FetchError::SubrequestHttpError {
+                    status_code: Some(418),
+                    service: "test_service".into(),
+                    reason: "418: I'm a teapot".into(),
+                }
+                .to_graphql_error(None),
+            )
+            .error(error)
+            .build();
+        assert_eq!(actual, expected);
     }
 }

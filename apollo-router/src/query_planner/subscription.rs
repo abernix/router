@@ -1,12 +1,13 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use futures::channel::mpsc;
+use apollo_compiler::NodeStr;
 use futures::future;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json_bytes::Value;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tower::ServiceExt;
 use tracing_futures::Instrument;
 
@@ -15,13 +16,12 @@ use super::fetch::Variables;
 use super::rewrites;
 use super::OperationKind;
 use crate::error::FetchError;
-use crate::graphql;
 use crate::graphql::Error;
 use crate::graphql::Request;
 use crate::graphql::Response;
 use crate::http_ext;
 use crate::json_ext::Path;
-use crate::notification::HandleStream;
+use crate::services::subgraph::BoxGqlStream;
 use crate::services::SubgraphRequest;
 use crate::services::SubscriptionTaskParams;
 
@@ -57,16 +57,16 @@ impl SubscriptionHandle {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SubscriptionNode {
     /// The name of the service or subgraph that the subscription is querying.
-    pub(crate) service_name: String,
+    pub(crate) service_name: NodeStr,
 
     /// The variables that are used for the subgraph subscription.
-    pub(crate) variable_usages: Vec<String>,
+    pub(crate) variable_usages: Vec<NodeStr>,
 
     /// The GraphQL subquery that is used for the subscription.
-    pub(crate) operation: String,
+    pub(crate) operation: super::fetch::SubgraphOperation,
 
     /// The GraphQL subquery operation name.
-    pub(crate) operation_name: Option<String>,
+    pub(crate) operation_name: Option<NodeStr>,
 
     /// The GraphQL operation kind that is used for the fetch.
     pub(crate) operation_kind: OperationKind,
@@ -84,7 +84,7 @@ impl SubscriptionNode {
         parameters: &'a ExecutionParameters<'a>,
         current_dir: &'a Path,
         parent_value: &'a Value,
-        sender: futures::channel::mpsc::Sender<Response>,
+        sender: tokio::sync::mpsc::Sender<Response>,
     ) -> future::BoxFuture<Vec<Error>> {
         if parameters.subscription_handle.is_none() {
             tracing::error!("No subscription handle provided for a subscription");
@@ -133,8 +133,7 @@ impl SubscriptionNode {
 
             match mode {
                 Some((subscription_config, _mode)) => {
-                    let (tx_handle, rx_handle) =
-                        mpsc::channel::<HandleStream<String, graphql::Response>>(1);
+                    let (tx_handle, rx_handle) = mpsc::channel::<BoxGqlStream>(1);
 
                     let subscription_conf_tx = match subscription_handle.subscription_conf_tx.take()
                     {
@@ -151,8 +150,8 @@ impl SubscriptionNode {
                         client_sender: sender,
                         subscription_handle,
                         subscription_config,
-                        stream_rx: rx_handle,
-                        service_name: self.service_name.clone(),
+                        stream_rx: rx_handle.into(),
+                        service_name: self.service_name.to_string(),
                     };
 
                     if let Err(err) = subscription_conf_tx.send(subs_params).await {
@@ -191,7 +190,7 @@ impl SubscriptionNode {
         parameters: &'a ExecutionParameters<'a>,
         current_dir: &'a Path,
         data: &Value,
-        tx_gql: mpsc::Sender<HandleStream<String, graphql::Response>>,
+        tx_gql: mpsc::Sender<BoxGqlStream>,
     ) -> Result<Vec<Error>, FetchError> {
         let SubscriptionNode {
             operation,
@@ -202,16 +201,14 @@ impl SubscriptionNode {
 
         let Variables { variables, .. } = match Variables::new(
             &[],
-            self.variable_usages.as_ref(),
+            &self.variable_usages,
             data,
             current_dir,
             // Needs the original request here
             parameters.supergraph_request,
             parameters.schema,
             &self.input_rewrites,
-        )
-        .await
-        {
+        ) {
             Some(variables) => variables,
             None => {
                 return Ok(Vec::new());
@@ -236,8 +233,8 @@ impl SubscriptionNode {
                     )
                     .body(
                         Request::builder()
-                            .query(operation)
-                            .and_operation_name(operation_name.clone())
+                            .query(operation.as_serialized())
+                            .and_operation_name(operation_name.as_ref().map(|n| n.to_string()))
                             .variables(variables.clone())
                             .build(),
                     )
@@ -246,6 +243,7 @@ impl SubscriptionNode {
             )
             .operation_kind(OperationKind::Subscription)
             .context(parameters.context.clone())
+            .subgraph_name(self.service_name.to_string())
             .subscription_stream(tx_gql)
             .and_connection_closed_signal(parameters.subscription_handle.as_ref().map(|s| s.closed_signal.resubscribe()))
             .build();

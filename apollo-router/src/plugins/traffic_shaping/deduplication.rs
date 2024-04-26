@@ -15,8 +15,10 @@ use tower::BoxError;
 use tower::Layer;
 use tower::ServiceExt;
 
+use crate::batching::BatchQuery;
 use crate::graphql::Request;
 use crate::http_ext;
+use crate::plugins::authorization::CacheKeyMetadata;
 use crate::query_planner::fetch::OperationKind;
 use crate::services::SubgraphRequest;
 use crate::services::SubgraphResponse;
@@ -35,8 +37,9 @@ where
     }
 }
 
-type WaitMap =
-    Arc<Mutex<HashMap<http_ext::Request<Request>, Sender<Result<CloneSubgraphResponse, String>>>>>;
+type CacheKey = (http_ext::Request<Request>, Arc<CacheKeyMetadata>);
+
+type WaitMap = Arc<Mutex<HashMap<CacheKey, Sender<Result<CloneSubgraphResponse, String>>>>>;
 
 struct CloneSubgraphResponse(SubgraphResponse);
 
@@ -71,9 +74,24 @@ where
         wait_map: WaitMap,
         request: SubgraphRequest,
     ) -> Result<SubgraphResponse, BoxError> {
+        // Check if the request is part of a batch. If it is, completely bypass dedup since it
+        // will break any request batches which this request is part of.
+        // This check is what enables Batching and Dedup to work together, so be very careful
+        // before making any changes to it.
+        if request
+            .context
+            .extensions()
+            .lock()
+            .contains_key::<BatchQuery>()
+        {
+            return service.ready_oneshot().await?.call(request).await;
+        }
         loop {
             let mut locked_wait_map = wait_map.lock().await;
-            match locked_wait_map.get_mut(&(&request.subgraph_request).into()) {
+            let authorization_cache_key = request.authorization.clone();
+            let cache_key = ((&request.subgraph_request).into(), authorization_cache_key);
+
+            match locked_wait_map.get_mut(&cache_key) {
                 Some(waiter) => {
                     // Register interest in key
                     let mut receiver = waiter.subscribe();
@@ -97,11 +115,12 @@ where
                 None => {
                     let (tx, _rx) = broadcast::channel(1);
 
-                    locked_wait_map.insert((&request.subgraph_request).into(), tx.clone());
+                    locked_wait_map.insert(cache_key, tx.clone());
                     drop(locked_wait_map);
 
                     let context = request.context.clone();
-                    let http_request = (&request.subgraph_request).into();
+                    let authorization_cache_key = request.authorization.clone();
+                    let cache_key = ((&request.subgraph_request).into(), authorization_cache_key);
                     let res = {
                         // when _drop_signal is dropped, either by getting out of the block, returning
                         // the error from ready_oneshot or by cancellation, the drop_sentinel future will
@@ -110,7 +129,7 @@ where
                         tokio::task::spawn(async move {
                             let _ = drop_sentinel.await;
                             let mut locked_wait_map = wait_map.lock().await;
-                            locked_wait_map.remove(&http_request);
+                            locked_wait_map.remove(&cache_key);
                         });
 
                         service

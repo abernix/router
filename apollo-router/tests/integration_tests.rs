@@ -17,6 +17,7 @@ use apollo_router::services::supergraph;
 use apollo_router::test_harness::mocks::persisted_queries::*;
 use apollo_router::Configuration;
 use apollo_router::Context;
+use apollo_router::_private::create_test_service_factory_from_yaml;
 use futures::StreamExt;
 use http::header::ACCEPT;
 use http::header::CONTENT_TYPE;
@@ -26,7 +27,6 @@ use http::StatusCode;
 use http::Uri;
 use maplit::hashmap;
 use mime::APPLICATION_JSON;
-use serde_json::to_string_pretty;
 use serde_json_bytes::json;
 use serde_json_bytes::Value;
 use tower::BoxError;
@@ -34,70 +34,7 @@ use tower::ServiceExt;
 use walkdir::DirEntry;
 use walkdir::WalkDir;
 
-macro_rules! assert_federated_response {
-    ($query:expr, $service_requests:expr $(,)?) => {
-        let request = supergraph::Request::fake_builder()
-            .query($query)
-            .variable("topProductsFirst", 2_i32)
-            .variable("reviewsForAuthorAuthorId", 1_i32)
-            .method(Method::POST)
-            .build()
-            .unwrap();
-
-        let expected = match query_node(&request).await {
-            Ok(e) => e,
-            Err(err) => {
-                panic!("query_node failed: {err}. Probably caused by missing gateway during testing");
-            }
-        };
-        assert_eq!(expected.errors, []);
-
-        let (actual, registry) = query_rust(request).await;
-        assert_eq!(actual.errors, []);
-
-        tracing::debug!("query:\n{}\n", $query);
-
-        assert!(
-            expected.data.as_ref().unwrap().is_object(),
-            "nodejs: no response's data: please check that the gateway and the subgraphs are running",
-        );
-
-        tracing::debug!("expected: {}", to_string_pretty(&expected).unwrap());
-        tracing::debug!("actual: {}", to_string_pretty(&actual).unwrap());
-
-        let expected = expected.data.as_ref().expect("expected data should not be none");
-        let actual = actual.data.as_ref().expect("received data should not be none");
-        assert!(
-            expected.eq_and_ordered(actual),
-            "the gateway and the router didn't return the same data:\ngateway:\n{}\nrouter\n{}",
-            expected,
-            actual
-        );
-        assert_eq!(registry.totals(), $service_requests);
-    };
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn basic_request() {
-    assert_federated_response!(
-        r#"{ topProducts { name name2:name } }"#,
-        hashmap! {
-            "products".to_string()=>1,
-        },
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn basic_composition() {
-    assert_federated_response!(
-        r#"{ topProducts { upc name reviews {id product { name } author { id name } } } }"#,
-        hashmap! {
-            "products".to_string()=>2,
-            "reviews".to_string()=>1,
-            "accounts".to_string()=>1,
-        },
-    );
-}
+mod integration;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn api_schema_hides_field() {
@@ -110,10 +47,11 @@ async fn api_schema_hides_field() {
 
     let (actual, _) = query_rust(request).await;
 
-    assert!(actual.errors[0]
-        .message
-        .as_str()
-        .contains(r#"Cannot query field "inStock" on type "Product""#));
+    let message = &actual.errors[0].message;
+    assert!(
+        message.contains(r#"Cannot query field "inStock" on type "Product"."#),
+        "{message}"
+    );
     assert_eq!(
         actual.errors[0].extensions["code"].as_str(),
         Some("GRAPHQL_VALIDATION_FAILED"),
@@ -121,58 +59,25 @@ async fn api_schema_hides_field() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn api_schema_hides_field_rust_validation() {
+async fn validation_errors_from_rust() {
     let request = supergraph::Request::fake_builder()
-        .query(r#"{ topProducts { name inStock } }"#)
-        .variable("topProductsFirst", 2_i32)
-        .variable("reviewsForAuthorAuthorId", 1_i32)
+        .query(r#"{ topProducts { name(notAnArg: true) } } fragment Unused on Product { upc }"#)
         .build()
         .expect("expecting valid request");
 
-    let (actual, _) = query_rust_with_config(
+    let (response, _) = query_rust_with_config(
         request,
         serde_json::json!({
             "telemetry":{
               "apollo": {
                     "field_level_instrumentation_sampler": "always_off"
                 }
-            },
-            "experimental_graphql_validation_mode": "new",
+            }
         }),
     )
     .await;
 
-    assert!(actual.errors[0]
-        .message
-        .as_str()
-        .contains("cannot query field `inStock` on type `Product`"));
-    assert_eq!(
-        actual.errors[0].extensions["code"].as_str(),
-        Some("GRAPHQL_VALIDATION_FAILED"),
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn basic_mutation() {
-    assert_federated_response!(
-        r#"mutation {
-              createProduct(upc:"8", name:"Bob") {
-                upc
-                name
-                reviews {
-                  body
-                }
-              }
-              createReview(upc: "8", id:"100", body: "Bif"){
-                id
-                body
-              }
-            }"#,
-        hashmap! {
-            "products".to_string()=>1,
-            "reviews".to_string()=>2,
-        },
-    );
+    insta::assert_json_snapshot!(response.errors);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -533,7 +438,7 @@ async fn persisted_queries() {
     .await;
 
     let config = serde_json::json!({
-        "preview_persisted_queries": {
+        "persisted_queries": {
             "enabled": true
         },
         "apq": {
@@ -684,7 +589,7 @@ async fn missing_variables() {
 
 const PARSER_LIMITS_TEST_QUERY: &str =
     r#"{ me { reviews { author { reviews { author { name } } } } } }"#;
-const PARSER_LIMITS_TEST_QUERY_TOKEN_COUNT: usize = 35;
+const PARSER_LIMITS_TEST_QUERY_TOKEN_COUNT: usize = 36;
 const PARSER_LIMITS_TEST_QUERY_RECURSION: usize = 6;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -737,7 +642,11 @@ async fn query_just_at_recursion_limit() {
     .unwrap();
 
     assert_eq!(1, actual.errors.len());
-    assert!(actual.errors[0].message.contains("parser limit(5) reached"));
+    let message = &actual.errors[0].message;
+    assert!(
+        message.contains("parser recursion limit reached"),
+        "{message}"
+    );
     assert_eq!(registry.totals(), expected_service_hits);
 }
 
@@ -799,7 +708,7 @@ async fn query_just_at_token_limit() {
 async fn normal_query_with_defer_accept_header() {
     let request = supergraph::Request::fake_builder()
         .query(r#"{ me { reviews { author { reviews { author { name } } } } } }"#)
-        .header(ACCEPT, "multipart/mixed; deferSpec=20220824")
+        .header(ACCEPT, "multipart/mixed;deferSpec=20220824")
         .build()
         .expect("expecting valid request");
     let (mut response, _registry) = {
@@ -828,8 +737,7 @@ async fn defer_path_with_disabled_config() {
             "apollo.include_subgraph_errors": {
                 "all": true
             }
-        },
-        "experimental_graphql_validation_mode": "both",
+        }
     });
     let request = supergraph::Request::fake_builder()
         .query(
@@ -842,7 +750,7 @@ async fn defer_path_with_disabled_config() {
             }
         }"#,
         )
-        .header(ACCEPT, "multipart/mixed; deferSpec=20220824")
+        .header(ACCEPT, "multipart/mixed;deferSpec=20220824")
         .build()
         .expect("expecting failure due to disabled config defer support");
 
@@ -879,7 +787,7 @@ async fn defer_path() {
             }
         }"#,
         )
-        .header(ACCEPT, "multipart/mixed; deferSpec=20220824")
+        .header(ACCEPT, "multipart/mixed;deferSpec=20220824")
         .build()
         .expect("expecting valid request");
 
@@ -922,7 +830,7 @@ async fn defer_path_in_array() {
                 }
             }"#,
         )
-        .header(ACCEPT, "multipart/mixed; deferSpec=20220824")
+        .header(ACCEPT, "multipart/mixed;deferSpec=20220824")
         .build()
         .expect("expecting valid request");
 
@@ -995,7 +903,7 @@ async fn defer_empty_primary_response() {
             }
         }"#,
         )
-        .header(ACCEPT, "multipart/mixed; deferSpec=20220824")
+        .header(ACCEPT, "multipart/mixed;deferSpec=20220824")
         .build()
         .expect("expecting valid request");
 
@@ -1032,7 +940,7 @@ async fn defer_default_variable() {
 
     let request = supergraph::Request::fake_builder()
         .query(query)
-        .header(ACCEPT, "multipart/mixed; deferSpec=20220824")
+        .header(ACCEPT, "multipart/mixed;deferSpec=20220824")
         .build()
         .expect("expecting valid request");
 
@@ -1052,7 +960,7 @@ async fn defer_default_variable() {
     let request = supergraph::Request::fake_builder()
         .query(query)
         .variable("if", false)
-        .header(ACCEPT, "multipart/mixed; deferSpec=20220824")
+        .header(ACCEPT, "multipart/mixed;deferSpec=20220824")
         .build()
         .expect("expecting valid request");
 
@@ -1096,16 +1004,133 @@ async fn include_if_works() {
     insta::assert_json_snapshot!(stream.next().await.unwrap().unwrap());
 }
 
-async fn query_node(request: &supergraph::Request) -> Result<graphql::Response, String> {
-    reqwest::Client::new()
-        .post("https://federation-demo-gateway.fly.dev/")
-        .json(request.supergraph_request.body())
-        .send()
-        .await
-        .map_err(|err| format!("HTTP fetch failed from 'test node': {err}"))?
-        .json()
-        .await
-        .map_err(|err| format!("service 'test node' response was malformed: {err}"))
+#[tokio::test(flavor = "multi_thread")]
+async fn query_operation_id() {
+    let config = serde_json::json!({
+        "supergraph": {
+            "introspection": true
+        },
+    });
+
+    let expected_apollo_operation_id = "d1554552698157b05c2a462827fb4367a4548ee5";
+
+    let request: router::Request = supergraph::Request::fake_builder()
+        .query(
+            r#"query IgnitionMeQuery {
+            me {
+              id
+            }
+          }"#,
+        )
+        .method(Method::POST)
+        .build()
+        .expect("expecting valid request")
+        .try_into()
+        .unwrap();
+
+    let (router, _) = setup_router_and_registry(config).await;
+
+    let response = http_query_with_router(router.clone(), request).await;
+    assert_eq!(
+        expected_apollo_operation_id,
+        response
+            .context
+            .get::<_, String>("apollo_operation_id".to_string())
+            .unwrap()
+            .unwrap()
+            .as_str()
+    );
+
+    // let's do it again to make sure a cached query plan still yields a stats report key hash
+    let request: router::Request = supergraph::Request::fake_builder()
+        .query(
+            r#"query IgnitionMeQuery {
+                me {
+                    id
+                }
+            }"#,
+        )
+        .method(Method::POST)
+        .build()
+        .expect("expecting valid request")
+        .try_into()
+        .unwrap();
+
+    let response = http_query_with_router(router.clone(), request).await;
+    assert_eq!(
+        expected_apollo_operation_id,
+        response
+            .context
+            .get::<_, String>("apollo_operation_id".to_string())
+            .unwrap()
+            .unwrap()
+            .as_str()
+    );
+
+    // let's test failures now
+    let parse_failure: router::Request = supergraph::Request::fake_builder()
+        .query(r#"that's not even a query!"#)
+        .method(Method::POST)
+        .build()
+        .expect("expecting valid request")
+        .try_into()
+        .unwrap();
+
+    let response = http_query_with_router(router.clone(), parse_failure).await;
+    assert!(
+        // "## GraphQLParseFailure\n"
+        response
+            .context
+            .get::<_, String>("apollo_operation_id".to_string())
+            .unwrap()
+            .is_none()
+    );
+
+    let unknown_operation_name: router::Request = supergraph::Request::fake_builder()
+        .query(
+            r#"query Me {
+                me {
+                    id
+                }
+            }"#,
+        )
+        .operation_name("NotMe")
+        .method(Method::POST)
+        .build()
+        .expect("expecting valid request")
+        .try_into()
+        .unwrap();
+
+    let response = http_query_with_router(router.clone(), unknown_operation_name).await;
+    // "## GraphQLUnknownOperationName\n"
+    assert!(response
+        .context
+        .get::<_, String>("apollo_operation_id".to_string())
+        .unwrap()
+        .is_none());
+
+    let validation_error: router::Request = supergraph::Request::fake_builder()
+        .query(
+            r#"query Me {
+            me {
+                thisfielddoesntexist
+            }
+        }"#,
+        )
+        .operation_name("NotMe")
+        .method(Method::POST)
+        .build()
+        .expect("expecting valid request")
+        .try_into()
+        .unwrap();
+
+    let response = http_query_with_router(router, validation_error).await;
+    // "## GraphQLValidationFailure\n"
+    assert!(response
+        .context
+        .get::<_, String>("apollo_operation_id".to_string())
+        .unwrap()
+        .is_none());
 }
 
 async fn http_query_rust(
@@ -1124,8 +1149,7 @@ async fn query_rust(
               "apollo": {
                     "field_level_instrumentation_sampler": "always_off"
                 }
-            },
-            "experimental_graphql_validation_mode": "both",
+            }
         }),
     )
     .await
@@ -1353,7 +1377,7 @@ async fn all_stock_router_example_yamls_are_valid() {
                         let mut configuration: Configuration = serde_yaml::from_str(&raw_yaml)
                             .unwrap_or_else(|e| panic!("unable to parse YAML {display_path}: {e}"));
                         let (_mock_guard, configuration) =
-                            if configuration.preview_persisted_queries.enabled {
+                            if configuration.persisted_queries.enabled {
                                 let (_mock_guard, uplink_config) = mock_empty_pq_uplink().await;
                                 configuration.uplink = Some(uplink_config);
                                 (Some(_mock_guard), configuration)
@@ -1387,4 +1411,25 @@ Make sure it is accessible, and the configuration is working with the router."#,
         );
 
     insta::assert_snapshot!(include_str!("../../examples/graphql/supergraph.graphql"));
+}
+
+// This test must use the multi_thread tokio executor or the opentelemetry hang bug will
+// be encountered. (See https://github.com/open-telemetry/opentelemetry-rust/issues/536)
+#[tokio::test(flavor = "multi_thread")]
+#[tracing_test::traced_test]
+async fn test_telemetry_doesnt_hang_with_invalid_schema() {
+    create_test_service_factory_from_yaml(
+        include_str!("../src/testdata/invalid_supergraph.graphql"),
+        r#"
+    telemetry:
+      exporters:
+        tracing:
+          common:
+            service_name: router
+          otlp:
+            enabled: true
+            endpoint: default
+"#,
+    )
+    .await;
 }

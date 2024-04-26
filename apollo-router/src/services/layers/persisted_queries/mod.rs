@@ -4,21 +4,18 @@ mod manifest_poller;
 #[cfg(test)]
 use std::sync::Arc;
 
-use apollo_compiler::AstDatabase;
-use apollo_compiler::HirDatabase;
-use apollo_compiler::InputDatabase;
 use http::header::CACHE_CONTROL;
 use http::HeaderValue;
+use http::StatusCode;
 use id_extractor::PersistedQueryIdExtractor;
 pub(crate) use manifest_poller::PersistedQueryManifestPoller;
 use tower::BoxError;
 
 use self::manifest_poller::FreeformGraphQLAction;
-use super::query_analysis::Compiler;
+use super::query_analysis::ParsedDocument;
 use crate::graphql::Error as GraphQLError;
 use crate::services::SupergraphRequest;
 use crate::services::SupergraphResponse;
-use crate::spec::query::QUERY_EXECUTABLE;
 use crate::Configuration;
 
 const DONT_CACHE_RESPONSE_VALUE: &str = "private, no-cache, must-revalidate";
@@ -37,7 +34,7 @@ impl PersistedQueryLayer {
     /// Create a new [`PersistedQueryLayer`] from CLI options, YAML configuration,
     /// and optionally, an existing persisted query manifest poller.
     pub(crate) async fn new(configuration: &Configuration) -> Result<Self, BoxError> {
-        if configuration.preview_persisted_queries.enabled {
+        if configuration.persisted_queries.enabled {
             Ok(Self {
                 manifest_poller: Some(
                     PersistedQueryManifestPoller::new(configuration.clone()).await?,
@@ -116,14 +113,14 @@ impl PersistedQueryLayer {
             if let Some(persisted_query_body) =
                 manifest_poller.get_operation_body(persisted_query_id)
             {
-                let mut body = request.supergraph_request.body_mut();
+                let body = request.supergraph_request.body_mut();
                 body.query = Some(persisted_query_body);
                 body.extensions.remove("persistedQuery");
                 // Record that we actually used our ID, so we can skip the
                 // safelist check later.
                 request
                     .context
-                    .private_entries
+                    .extensions()
                     .lock()
                     .insert(UsedQueryIdFromManifest);
                 tracing::info!(monotonic_counter.apollo.router.operations.persisted_queries = 1u64);
@@ -165,8 +162,8 @@ impl PersistedQueryLayer {
             Some(ob) => ob,
         };
 
-        let compiler = {
-            let context_guard = request.context.private_entries.lock();
+        let doc = {
+            let context_guard = request.context.extensions().lock();
 
             if context_guard.get::<UsedQueryIdFromManifest>().is_some() {
                 // We got this operation from the manifest, so there's no
@@ -175,33 +172,21 @@ impl PersistedQueryLayer {
                 return Ok(request);
             }
 
-            match context_guard.get::<Compiler>() {
+            match context_guard.get::<ParsedDocument>() {
                 None => {
                     drop(context_guard);
-                    // For some reason, QueryAnalysisLayer didn't give us a Compiler?
+                    // For some reason, QueryAnalysisLayer didn't give us a document?
                     return Err(supergraph_err(
                         graphql_err(
                             "MISSING_PARSED_OPERATION",
-                            "internal error: compiler missing",
+                            "internal error: executable document missing",
                         ),
                         request,
                         ErrorCacheStrategy::DontCache,
+                        StatusCode::INTERNAL_SERVER_ERROR,
                     ));
                 }
-                Some(c) => c.0.clone(),
-            }
-        };
-
-        let compiler_guard = compiler.lock().await;
-        let db = &compiler_guard.db;
-        let file_id = match db.source_file(QUERY_EXECUTABLE.into()) {
-            Some(file_id) => file_id,
-            None => {
-                return Err(supergraph_err(
-                    graphql_err("MISSING_PARSED_OPERATION", "missing input file for query"),
-                    request,
-                    ErrorCacheStrategy::DontCache,
-                ))
+                Some(d) => d.clone(),
             }
         };
 
@@ -211,16 +196,15 @@ impl PersistedQueryLayer {
         // __type/__schema/__typename.) We do want to make sure the document
         // parsed properly before poking around at it, though.
         if self.introspection_enabled
-            && db.ast(file_id).errors().peekable().peek().is_none()
-            && db
-                .operations(file_id)
-                .iter()
-                .all(|op| op.is_introspection(db))
+            && doc
+                .executable
+                .all_operations()
+                .all(|op| op.is_introspection(&doc.executable))
         {
             return Ok(request);
         }
 
-        match manifest_poller.action_for_freeform_graphql(operation_body, db.ast(file_id)) {
+        match manifest_poller.action_for_freeform_graphql(Ok(&doc.ast)) {
             FreeformGraphQLAction::Allow => {
                 tracing::info!(monotonic_counter.apollo.router.operations.persisted_queries = 1u64,);
                 Ok(request)
@@ -252,6 +236,12 @@ impl PersistedQueryLayer {
             }
         }
     }
+
+    pub(crate) fn all_operations(&self) -> Option<Vec<String>> {
+        self.manifest_poller
+            .as_ref()
+            .map(|poller| poller.get_all_operations())
+    }
 }
 
 fn log_unknown_operation(operation_body: &str) {
@@ -269,9 +259,11 @@ impl ErrorCacheStrategy {
         &self,
         graphql_error: GraphQLError,
         request: SupergraphRequest,
+        status_code: StatusCode,
     ) -> SupergraphResponse {
         let mut error_builder = SupergraphResponse::error_builder()
             .error(graphql_error)
+            .status_code(status_code)
             .context(request.context);
 
         if matches!(self, Self::DontCache) {
@@ -304,6 +296,7 @@ fn supergraph_err_operation_not_found(
         graphql_err_operation_not_found(persisted_query_id),
         request,
         ErrorCacheStrategy::DontCache,
+        StatusCode::NOT_FOUND,
     )
 }
 
@@ -321,6 +314,7 @@ fn supergraph_err_cannot_send_id_and_body_with_apq_disabled(
         graphql_err_cannot_send_id_and_body(),
         request,
         ErrorCacheStrategy::DontCache,
+        StatusCode::BAD_REQUEST,
     )
 }
 
@@ -336,6 +330,7 @@ fn supergraph_err_operation_not_in_safelist(request: SupergraphRequest) -> Super
         graphql_err_operation_not_in_safelist(),
         request,
         ErrorCacheStrategy::DontCache,
+        StatusCode::FORBIDDEN,
     )
 }
 
@@ -350,6 +345,7 @@ fn supergraph_err_pq_id_required(request: SupergraphRequest) -> SupergraphRespon
         graphql_err_pq_id_required(),
         request,
         ErrorCacheStrategy::Cache,
+        StatusCode::BAD_REQUEST,
     )
 }
 
@@ -364,8 +360,9 @@ fn supergraph_err(
     graphql_error: GraphQLError,
     request: SupergraphRequest,
     cache_strategy: ErrorCacheStrategy,
+    status_code: StatusCode,
 ) -> SupergraphResponse {
-    cache_strategy.get_supergraph_response(graphql_error, request)
+    cache_strategy.get_supergraph_response(graphql_error, request, status_code)
 }
 
 #[cfg(test)]
@@ -523,9 +520,11 @@ mod tests {
 
         assert!(incoming_request.supergraph_request.body().query.is_none());
 
-        let response = pq_layer
+        let mut supergraph_response = pq_layer
             .supergraph_request(incoming_request)
-            .expect_err("pq layer returned request instead of returning an error response")
+            .expect_err("pq layer returned request instead of returning an error response");
+        assert_eq!(supergraph_response.response.status(), 404);
+        let response = supergraph_response
             .next_response()
             .await
             .expect("could not get response from pq layer");
@@ -637,12 +636,14 @@ mod tests {
         let request_with_analyzed_query =
             run_first_two_layers(pq_layer, query_analysis_layer, body).await;
 
-        let response = pq_layer
+        let mut supergraph_response = pq_layer
             .supergraph_request_with_analyzed_query(request_with_analyzed_query)
             .await
             .expect_err(
                 "pq layer second hook returned request instead of returning an error response",
-            )
+            );
+        assert_eq!(supergraph_response.response.status(), 403);
+        let response = supergraph_response
             .next_response()
             .await
             .expect("could not get response from pq layer");
@@ -671,7 +672,7 @@ mod tests {
     async fn pq_layer_freeform_graphql_with_safelist() {
         let manifest = HashMap::from([(
             "valid-syntax".to_string(),
-            "fragment A on T { a }    query SomeOp { ...A ...B }    fragment,,, B on U{b c  } # yeah"
+            "fragment A on Query { me { id } }    query SomeOp { ...A ...B }    fragment,,, B on Query{me{name,username}  } # yeah"
                 .to_string(),
         ), (
             "invalid-syntax".to_string(),
@@ -698,7 +699,7 @@ mod tests {
         let schema = Arc::new(
             Schema::parse_test(
                 include_str!("../../../testdata/supergraph.graphql"),
-                &config,
+                &Default::default(),
             )
             .unwrap(),
         );
@@ -709,7 +710,7 @@ mod tests {
         denied_by_safelist(
             &pq_layer,
             &query_analysis_layer,
-            "query SomeQuery { hooray }",
+            "query SomeQuery { me { id } }",
         )
         .await;
 
@@ -717,7 +718,7 @@ mod tests {
         allowed_by_safelist(
             &pq_layer,
             &query_analysis_layer,
-            "fragment A on T { a }    query SomeOp { ...A ...B }    fragment,,, B on U{b c  } # yeah",
+            "fragment A on Query { me { id } }    query SomeOp { ...A ...B }    fragment,,, B on Query{me{name,username}  } # yeah",
         )
         .await;
 
@@ -725,21 +726,15 @@ mod tests {
         allowed_by_safelist(
                 &pq_layer,
                 &query_analysis_layer,
-                    "#comment\n  fragment, B on U  , { b    c }    query SomeOp {  ...A ...B }  fragment    \nA on T { a }"
+                    "#comment\n  fragment, B on Query  , { me{name    username} }    query SomeOp {  ...A ...B }  fragment    \nA on Query { me{ id} }"
             ).await;
 
         // Reordering fields does not match!
         denied_by_safelist(
                 &pq_layer,
                 &query_analysis_layer,
-                    "fragment A on T { a }    query SomeOp { ...A ...B }    fragment,,, B on U{c b  } # yeah"
+                "fragment A on Query { me { id } }    query SomeOp { ...A ...B }    fragment,,, B on Query{me{username,name}  } # yeah"
             ).await;
-
-        // Documents with invalid syntax don't match...
-        denied_by_safelist(&pq_layer, &query_analysis_layer, "}}}}").await;
-
-        // ... unless they precisely match a safelisted document that also has invalid syntax.
-        allowed_by_safelist(&pq_layer, &query_analysis_layer, "}}}").await;
 
         // Introspection queries are allowed (even using fragments and aliases), because
         // introspection is enabled.
@@ -749,9 +744,9 @@ mod tests {
             r#"fragment F on Query { __typename foo: __schema { __typename } } query Q { __type(name: "foo") { name } ...F }"#,
         ).await;
 
-        // This should actually be allowed, but is denied due to https://github.com/apollographql/apollo-rs/issues/613;
-        // when that bug is fixed, switch this to allowed_by_safelist.
-        denied_by_safelist(
+        // Multiple spreads of the same fragment are also allowed
+        // (https://github.com/apollographql/apollo-rs/issues/613)
+        allowed_by_safelist(
             &pq_layer,
             &query_analysis_layer,
             r#"fragment F on Query { __typename foo: __schema { __typename } } query Q { __type(name: "foo") { name } ...F ...F }"#,
@@ -761,7 +756,7 @@ mod tests {
         denied_by_safelist(
             &pq_layer,
             &query_analysis_layer,
-            r#"fragment F on Query { __typename foo: __schema { __typename } bla } query Q { __type(name: "foo") { name } ...F }"#,
+            r#"fragment F on Query { __typename foo: __schema { __typename } me { id } } query Q { __type(name: "foo") { name } ...F }"#,
         ).await;
     }
 
@@ -917,9 +912,11 @@ mod tests {
 
         assert!(incoming_request.supergraph_request.body().query.is_some());
 
-        let result = pq_layer.supergraph_request(incoming_request);
-        let response = result
-            .expect_err("pq layer returned request instead of returning an error response")
+        let mut supergraph_response = pq_layer
+            .supergraph_request(incoming_request)
+            .expect_err("pq layer returned request instead of returning an error response");
+        assert_eq!(supergraph_response.response.status(), 400);
+        let response = supergraph_response
             .next_response()
             .await
             .expect("could not get response from pq layer");
@@ -1029,9 +1026,11 @@ mod tests {
 
         assert!(incoming_request.supergraph_request.body().query.is_some());
 
-        let result = pq_layer.supergraph_request(incoming_request);
-        let response = result
-            .expect_err("pq layer returned request instead of returning an error response")
+        let mut supergraph_response = pq_layer
+            .supergraph_request(incoming_request)
+            .expect_err("pq layer returned request instead of returning an error response");
+        assert_eq!(supergraph_response.response.status(), 400);
+        let response = supergraph_response
             .next_response()
             .await
             .expect("could not get response from pq layer");
@@ -1060,9 +1059,11 @@ mod tests {
 
         assert!(incoming_request.supergraph_request.body().query.is_some());
 
-        let response = pq_layer
+        let mut supergraph_response = pq_layer
             .supergraph_request(incoming_request)
-            .expect_err("pq layer returned request instead of returning an error response")
+            .expect_err("pq layer returned request instead of returning an error response");
+        assert_eq!(supergraph_response.response.status(), 400);
+        let response = supergraph_response
             .next_response()
             .await
             .expect("could not get response from pq layer");

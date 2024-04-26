@@ -2,11 +2,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::task::Poll;
+use std::time::Duration;
 
 use bytes::Buf;
 use futures::future::BoxFuture;
 use hmac::Hmac;
 use hmac::Mac;
+use http::HeaderName;
+use http::HeaderValue;
 use http::Method;
 use http::StatusCode;
 use multimap::MultiMap;
@@ -29,6 +32,7 @@ use crate::graphql::Response;
 use crate::json_ext::Object;
 use crate::layers::ServiceBuilderExt;
 use crate::notification::Notify;
+use crate::notification::NotifyError;
 use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
 use crate::protocols::websocket::WebSocketProtocol;
@@ -41,11 +45,12 @@ use crate::ListenAddr;
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 pub(crate) const APOLLO_SUBSCRIPTION_PLUGIN: &str = "apollo.subscription";
-#[cfg(not(test))]
 pub(crate) const APOLLO_SUBSCRIPTION_PLUGIN_NAME: &str = "subscription";
 pub(crate) static SUBSCRIPTION_CALLBACK_HMAC_KEY: OnceCell<String> = OnceCell::new();
 pub(crate) const SUBSCRIPTION_WS_CUSTOM_CONNECTION_PARAMS: &str =
     "apollo.subscription.custom_connection_params";
+const CALLBACK_SUBSCRIPTION_HEADER_NAME: &str = "subscription-protocol";
+const CALLBACK_SUBSCRIPTION_HEADER_VALUE: &str = "callback/1.0";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Subscription {
@@ -56,22 +61,18 @@ pub(crate) struct Subscription {
 
 /// Subscriptions configuration
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub(crate) struct SubscriptionConfig {
     /// Enable subscription
     pub(crate) enabled: bool,
     /// Select a subscription mode (callback or passthrough)
-    #[serde(default)]
     pub(crate) mode: SubscriptionModeConfig,
     /// Enable the deduplication of subscription (for example if we detect the exact same request to subgraph we won't open a new websocket to the subgraph in passthrough mode)
     /// (default: true)
-    #[serde(default)]
     pub(crate) enable_deduplication: bool,
     /// This is a limit to only have maximum X opened subscriptions at the same time. By default if it's not set there is no limit.
-    #[serde(default)]
     pub(crate) max_opened_subscriptions: Option<usize>,
     /// It represent the capacity of the in memory queue to know how many events we can keep in a buffer
-    #[serde(default)]
     pub(crate) queue_capacity: Option<usize>,
 }
 
@@ -90,7 +91,6 @@ impl Default for SubscriptionConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SubscriptionModeConfig {
-    #[serde(rename = "preview_callback")]
     /// Enable callback mode for subgraph(s)
     pub(crate) callback: Option<CallbackMode>,
     /// Enable passthrough mode for subgraph(s)
@@ -112,6 +112,7 @@ impl SubscriptionModeConfig {
             if callback_cfg.subgraphs.contains(service_name) || callback_cfg.subgraphs.is_empty() {
                 let callback_cfg = CallbackMode {
                     public_url: callback_cfg.public_url.clone(),
+                    heartbeat_interval: callback_cfg.heartbeat_interval,
                     listen: callback_cfg.listen.clone(),
                     path: callback_cfg.path.clone(),
                     subgraphs: HashSet::new(), // We don't need it
@@ -146,8 +147,12 @@ pub(crate) enum SubscriptionMode {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CallbackMode {
     #[schemars(with = "String")]
-    /// URL used to access this router instance
+    /// URL used to access this router instance, including the path configured on the Router
     pub(crate) public_url: url::Url,
+
+    /// Heartbeat interval for callback mode (default: 5secs)
+    #[serde(default = "HeartbeatInterval::new_enabled")]
+    pub(crate) heartbeat_interval: HeartbeatInterval,
     // `skip_serializing` We don't need it in the context
     /// Listen address on which the callback must listen (default: 127.0.0.1:4000)
     #[serde(skip_serializing)]
@@ -163,6 +168,47 @@ pub(crate) struct CallbackMode {
     pub(crate) subgraphs: HashSet<String>,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case", untagged)]
+pub(crate) enum HeartbeatInterval {
+    /// disable heartbeat
+    Disabled(Disabled),
+    /// enable with default interval of 5s
+    Enabled(Enabled),
+    /// enable with custom interval, e.g. '100ms', '10s' or '1m'
+    #[serde(with = "humantime_serde")]
+    #[schemars(with = "String")]
+    Duration(Duration),
+}
+
+impl HeartbeatInterval {
+    pub(crate) fn new_enabled() -> Self {
+        Self::Enabled(Enabled::Enabled)
+    }
+    pub(crate) fn new_disabled() -> Self {
+        Self::Disabled(Disabled::Disabled)
+    }
+    pub(crate) fn into_option(self) -> Option<Duration> {
+        match self {
+            Self::Disabled(_) => None,
+            Self::Enabled(_) => Some(Duration::from_secs(5)),
+            Self::Duration(duration) => Some(duration),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Disabled {
+    Disabled,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Enabled {
+    Enabled,
+}
+
 /// Using websocket to directly connect to subgraph
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -171,14 +217,19 @@ pub(crate) struct PassthroughMode {
     subgraph: SubgraphPassthroughMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 /// WebSocket configuration for a specific subgraph
 pub(crate) struct WebSocketConfiguration {
     /// Path on which WebSockets are listening
+    #[serde(default)]
     pub(crate) path: Option<String>,
     /// Which WebSocket GraphQL protocol to use for this subgraph possible values are: 'graphql_ws' | 'graphql_transport_ws' (default: graphql_ws)
+    #[serde(default)]
     pub(crate) protocol: WebSocketProtocol,
+    /// Heartbeat interval for graphql-ws protocol (default: disabled)
+    #[serde(default = "HeartbeatInterval::new_disabled")]
+    pub(crate) heartbeat_interval: HeartbeatInterval,
 }
 
 fn default_path() -> String {
@@ -201,6 +252,18 @@ impl Plugin for Subscription {
                     .get_or_init(|| Uuid::new_v4().to_string())
                     .clone(),
             );
+            #[cfg(not(test))]
+            init.notify
+                .set_ttl(
+                    init.config
+                        .mode
+                        .callback
+                        .as_ref()
+                        .expect("we checked in the condition the callback conf")
+                        .heartbeat_interval
+                        .into_option(),
+                )
+                .await?;
         }
 
         Ok(Subscription {
@@ -468,6 +531,7 @@ impl Service<router::Request> for CallbackService {
                                     Ok(router::Response {
                                         response: http::Response::builder()
                                             .status(StatusCode::NO_CONTENT)
+                                            .header(HeaderName::from_static(CALLBACK_SUBSCRIPTION_HEADER_NAME), HeaderValue::from_static(CALLBACK_SUBSCRIPTION_HEADER_VALUE))
                                             .body::<hyper::Body>("".into())
                                             .map_err(BoxError::from)?,
                                         context: req.context,
@@ -476,6 +540,7 @@ impl Service<router::Request> for CallbackService {
                                     Ok(router::Response {
                                         response: http::Response::builder()
                                             .status(StatusCode::NOT_FOUND)
+                                            .header(HeaderName::from_static(CALLBACK_SUBSCRIPTION_HEADER_NAME), HeaderValue::from_static(CALLBACK_SUBSCRIPTION_HEADER_VALUE))
                                             .body("suscription doesn't exist".into())
                                             .map_err(BoxError::from)?,
                                         context: req.context,
@@ -547,18 +612,53 @@ impl Service<router::Request> for CallbackService {
                                 ..
                             }) => {
                                 if let Some(errors) = errors {
-                                    let mut handle =
-                                        notify.subscribe(id.clone()).await?.into_sink();
+                                    let mut handle = match notify.subscribe(id.clone()).await {
+                                         Ok(handle) => handle.into_sink(),
+                                         Err(NotifyError::UnknownTopic) => {
+                                            return Ok(router::Response {
+                                                response: http::Response::builder()
+                                                    .status(StatusCode::NOT_FOUND)
+                                                    .body("unknown topic".into())
+                                                    .map_err(BoxError::from)?,
+                                                context: req.context,
+                                            });
+                                         },
+                                         Err(err) => {
+                                            return Ok(router::Response {
+                                                response: http::Response::builder()
+                                                    .status(StatusCode::NOT_FOUND)
+                                                    .body(err.to_string().into())
+                                                    .map_err(BoxError::from)?,
+                                                context: req.context,
+                                            });
+                                         }
+                                    };
                                     tracing::info!(
                                         monotonic_counter.apollo.router.operations.subscriptions.events = 1u64,
                                         subscriptions.mode="callback",
                                         subscriptions.complete=true
                                     );
-                                    handle.send_sync(
+                                    if let Err(_err) = handle.send_sync(
                                         graphql::Response::builder().errors(errors).build(),
-                                    )?;
+                                    ) {
+                                        return Ok(router::Response {
+                                            response: http::Response::builder()
+                                                .status(StatusCode::NOT_FOUND)
+                                                .body("cannot send errors to the client".into())
+                                                .map_err(BoxError::from)?,
+                                            context: req.context,
+                                        });
+                                    }
                                 }
-                                notify.force_delete(id).await?;
+                                if let Err(_err) = notify.force_delete(id).await {
+                                    return Ok(router::Response {
+                                        response: http::Response::builder()
+                                            .status(StatusCode::NOT_FOUND)
+                                            .body("cannot force delete".into())
+                                            .map_err(BoxError::from)?,
+                                        context: req.context,
+                                    });
+                                }
                                 Ok(router::Response {
                                     response: http::Response::builder()
                                         .status(StatusCode::ACCEPTED)
@@ -639,21 +739,24 @@ mod tests {
             .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
             .expect("Plugin not found")
             .create_instance(
-                &Value::from_str(
-                    r#"{
+                PluginInit::fake_builder()
+                    .config(
+                        Value::from_str(
+                            r#"{
                 "enabled": true,
                 "mode": {
-                    "preview_callback": {
-                        "public_url": "http://localhost:4000",
+                    "callback": {
+                        "public_url": "http://localhost:4000/subscription/callback",
                         "path": "/subscription/callback",
                         "subgraphs": ["test"]
                     }
                 }
             }"#,
-                )
-                .unwrap(),
-                Default::default(),
-                notify.clone(),
+                        )
+                        .unwrap(),
+                    )
+                    .notify(notify.clone())
+                    .build(),
             )
             .await
             .unwrap();
@@ -698,6 +801,12 @@ mod tests {
         .unwrap();
         let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(HeaderName::from_static(CALLBACK_SUBSCRIPTION_HEADER_NAME))
+                .unwrap(),
+            HeaderValue::from_static(CALLBACK_SUBSCRIPTION_HEADER_VALUE)
+        );
 
         let http_req = http::Request::post(format!(
             "http://localhost:4000/subscription/callback/{new_sub_id}"
@@ -771,21 +880,24 @@ mod tests {
             .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
             .expect("Plugin not found")
             .create_instance(
-                &Value::from_str(
-                    r#"{
-                "enabled": true,
-                "mode": {
-                    "preview_callback": {
-                        "public_url": "http://localhost:4000",
-                        "path": "/subscription/callback",
-                        "subgraphs": ["test"]
-                    }
-                }
-            }"#,
-                )
-                .unwrap(),
-                Default::default(),
-                notify.clone(),
+                PluginInit::fake_builder()
+                    .config(
+                        Value::from_str(
+                            r#"{
+                        "enabled": true,
+                        "mode": {
+                            "callback": {
+                                "public_url": "http://localhost:4000/subscription/callback",
+                                "path": "/subscription/callback",
+                                "subgraphs": ["test"]
+                            }
+                        }
+                    }"#,
+                        )
+                        .unwrap(),
+                    )
+                    .notify(notify.clone())
+                    .build(),
             )
             .await
             .unwrap();
@@ -856,21 +968,24 @@ mod tests {
             .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
             .expect("Plugin not found")
             .create_instance(
-                &Value::from_str(
-                    r#"{
+                PluginInit::fake_builder()
+                    .config(
+                        Value::from_str(
+                            r#"{
                 "enabled": true,
                 "mode": {
-                    "preview_callback": {
-                        "public_url": "http://localhost:4000",
+                    "callback": {
+                        "public_url": "http://localhost:4000/subscription/callback",
                         "path": "/subscription/callback",
                         "subgraphs": ["test"]
                     }
                 }
             }"#,
-                )
-                .unwrap(),
-                Default::default(),
-                notify.clone(),
+                        )
+                        .unwrap(),
+                    )
+                    .notify(notify.clone())
+                    .build(),
             )
             .await
             .unwrap();
@@ -916,6 +1031,12 @@ mod tests {
         .unwrap();
         let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(HeaderName::from_static(CALLBACK_SUBSCRIPTION_HEADER_NAME))
+                .unwrap(),
+            HeaderValue::from_static(CALLBACK_SUBSCRIPTION_HEADER_VALUE)
+        );
 
         let http_req = http::Request::post(format!(
             "http://localhost:4000/subscription/callback/{new_sub_id}"
@@ -999,15 +1120,13 @@ mod tests {
         let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
             .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
             .expect("Plugin not found")
-            .create_instance(
+            .create_instance_without_schema(
                 &Value::from_str(
                     r#"{
                     "enabled": false
                 }"#,
                 )
                 .unwrap(),
-                Default::default(),
-                Default::default(),
             )
             .await
             .unwrap();
@@ -1055,8 +1174,8 @@ mod tests {
         let config_with_callback: SubscriptionConfig = serde_json::from_value(serde_json::json!({
             "enabled": true,
             "mode": {
-                "preview_callback": {
-                    "public_url": "http://localhost:4000",
+                "callback": {
+                    "public_url": "http://localhost:4000/subscription/callback",
                     "path": "/subscription/callback",
                     "subgraphs": ["test"]
                 }
@@ -1069,7 +1188,7 @@ mod tests {
             subgraph_cfg,
             Some(SubscriptionMode::Callback(
                 serde_json::from_value::<CallbackMode>(serde_json::json!({
-                    "public_url": "http://localhost:4000",
+                    "public_url": "http://localhost:4000/subscription/callback",
                     "path": "/subscription/callback",
                     "subgraphs": []
                 }))
@@ -1081,8 +1200,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "enabled": true,
                 "mode": {
-                    "preview_callback": {
-                        "public_url": "http://localhost:4000",
+                    "callback": {
+                        "public_url": "http://localhost:4000/subscription/callback",
                         "path": "/subscription/callback",
                     }
                 }
@@ -1096,7 +1215,7 @@ mod tests {
             subgraph_cfg,
             Some(SubscriptionMode::Callback(
                 serde_json::from_value::<CallbackMode>(serde_json::json!({
-                    "public_url": "http://localhost:4000",
+                    "public_url": "http://localhost:4000/subscription/callback",
                     "path": "/subscription/callback",
                     "subgraphs": []
                 }))
@@ -1197,8 +1316,8 @@ mod tests {
         let config_with_both_mode: SubscriptionConfig = serde_json::from_value(serde_json::json!({
             "enabled": true,
             "mode": {
-                "preview_callback": {
-                    "public_url": "http://localhost:4000",
+                "callback": {
+                    "public_url": "http://localhost:4000/subscription/callback",
                     "path": "/subscription/callback",
                 },
                 "passthrough": {
@@ -1217,7 +1336,7 @@ mod tests {
             subgraph_cfg,
             Some(SubscriptionMode::Callback(
                 serde_json::from_value::<CallbackMode>(serde_json::json!({
-                    "public_url": "http://localhost:4000",
+                    "public_url": "http://localhost:4000/subscription/callback",
                     "path": "/subscription/callback",
                 }))
                 .unwrap()
@@ -1228,8 +1347,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "enabled": true,
                 "mode": {
-                    "preview_callback": {
-                        "public_url": "http://localhost:4000",
+                    "callback": {
+                        "public_url": "http://localhost:4000/subscription/callback",
                         "path": "/subscription/callback",
                     },
                     "passthrough": {
@@ -1268,6 +1387,22 @@ mod tests {
 
         let subgraph_cfg = config_without_mode.mode.get_subgraph_config("test");
         assert_eq!(subgraph_cfg, None);
+
+        let sub_config: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "mode": {
+                "callback": {
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                    "subgraphs": ["test"]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(sub_config.enabled);
+        assert!(sub_config.enable_deduplication);
+        assert!(sub_config.max_opened_subscriptions.is_none());
+        assert!(sub_config.queue_capacity.is_none());
     }
 }
 

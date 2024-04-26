@@ -37,7 +37,7 @@ pub(crate) fn generate_config_schema() -> RootSchema {
     // It's fine to just add it here.
     let gen = settings.into_generator();
     let mut schema = gen.into_root_schema_for::<Configuration>();
-    let mut root = schema.schema.object.as_mut().expect("schema not generated");
+    let root = schema.schema.object.as_mut().expect("schema not generated");
     root.additional_properties = Some(Box::new(schemars::schema::Schema::Bool(false)));
     schema
 }
@@ -251,6 +251,10 @@ pub(crate) fn validate_yaml_configuration(
         .collect();
 
     if !unknown_fields.is_empty() {
+        // If you end up here while contributing,
+        // It might mean you forgot to update
+        // `impl<'de> serde::Deserialize<'de> for Configuration
+        // In `/apollo-router/src/configuration/mod.rs`
         return Err(ConfigurationError::InvalidConfiguration {
             message: "unknown fields",
             error: format!(
