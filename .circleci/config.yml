@@ -240,9 +240,13 @@ commands:
               - equal: [ *windows_test_executor, << parameters.platform >> ]
           steps:
             - run:
-                name: Install scoop and mise
+                name: Install scoop
+                shell: powershell.exe -ExecutionPolicy Bypass
                 command: |
-                  powershell.exe 'iex "& {$(irm get.scoop.sh)} -RunAsAdmin"'
+                  iex "& {$(irm get.scoop.sh)} -RunAsAdmin"
+            - run:
+                name: Install mise
+                command: |
                   scoop install mise
                   mise trust
                   mise install --yes
