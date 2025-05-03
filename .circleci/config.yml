@@ -177,11 +177,12 @@ commands:
               - equal: [ *windows_test_executor, << parameters.platform >> ]
           steps:
             - run:
-                name: Create bash aliases
+                name: Extend Bash profile for Windows
                 command: |
                   echo 'alias find=/bin/find' >> "$BASH_ENV"
                   echo 'alias sort=/bin/sort' >> "$BASH_ENV"
                   echo 'export EXECUTABLE_SUFFIX=".exe"' >> "$BASH_ENV"
+                  echo 'export PATH="$HOME/AppData/Local/mise/shims:$HOME/scoop/apps/mise/current/bin:$HOME/scoop/shims' >> "$BASH_ENV"
             - run:
                 name: Write arch
                 command: |
@@ -215,14 +216,36 @@ commands:
       platform:
         type: executor
     steps:
-      - run:
-          name: Install mise
-          command: |
-            curl https://mise.jdx.dev/install.sh | sh
-            mise activate bash >> "$BASH_ENV"
-            mise trust
-            mise install --yes
-
+      - when:
+          condition:
+            or:
+              - equal: [ *amd_linux_build_executor, << parameters.platform >> ]
+              - equal: [ *amd_linux_test_executor, << parameters.platform >> ]
+              - equal: [ *arm_linux_build_executor, << parameters.platform >> ]
+              - equal: [ *arm_linux_test_executor, << parameters.platform >> ]
+              - equal: [ *macos_build_executor, << parameters.platform >> ]
+              - equal: [ *macos_test_executor, << parameters.platform >> ]
+          steps:
+            - run:
+                name: Install mise
+                command: |
+                  curl https://mise.jdx.dev/install.sh | sh
+                  mise activate bash >> "$BASH_ENV"
+                  mise trust
+                  mise install --yes
+      - when:
+          condition:
+            or:
+              - equal: [ *windows_build_executor, << parameters.platform >> ]
+              - equal: [ *windows_test_executor, << parameters.platform >> ]
+          steps:
+            - run:
+                name: Install scoop and mise
+                command: |
+                  powershell.exe 'iex "& {$(irm get.scoop.sh)} -RunAsAdmin"'
+                  scoop install mise
+                  mise trust
+                  mise install --yes
   # Platform-specific package installations
   install_packages:
     parameters:
