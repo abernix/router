@@ -17,10 +17,13 @@ executors:
     environment:
       CARGO_BUILD_JOBS: 4
       RUST_TEST_THREADS: 6
+      MISE_ENV: ci
   amd_linux_helm: &amd_linux_helm_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
     resource_class: large
+    environment:
+      MISE_ENV: ci
   amd_linux_test: &amd_linux_test_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
@@ -29,18 +32,21 @@ executors:
       - image: ghcr.io/datadog/dd-apm-test-agent/ddapm-test-agent:v1.21.1
     resource_class: large
     environment:
+      MISE_ENV: ci
       CARGO_BUILD_JOBS: 4
   arm_linux_build: &arm_linux_build_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
     resource_class: arm.large
     environment:
+      MISE_ENV: ci
       CARGO_BUILD_JOBS: 8
   arm_linux_test: &arm_linux_test_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
     resource_class: arm.large
     environment:
+      MISE_ENV: ci
       CARGO_BUILD_JOBS: 8
   macos_build: &macos_build_executor
     macos:
@@ -49,6 +55,8 @@ executors:
       # We use the major.minor notation to bring in compatible patches.
       xcode: "15.4.0"
     resource_class: macos.m1.medium.gen1
+    environment:
+      MISE_ENV: ci
   macos_test: &macos_test_executor
     macos:
       # See https://circleci.com/docs/xcode-policy along with the support matrix
@@ -56,16 +64,22 @@ executors:
       # We use the major.minor notation to bring in compatible patches.
       xcode: "15.4.0"
     resource_class: macos.m1.medium.gen1
+    environment:
+      MISE_ENV: ci
   windows_build: &windows_build_executor
     machine:
       image: "windows-server-2019-vs2019:2024.02.21"
     resource_class: windows.large
     shell: bash.exe --login -eo pipefail
+    environment:
+      MISE_ENV: ci,windows
   windows_test: &windows_test_executor
     machine:
       image: "windows-server-2019-vs2019:2024.02.21"
     resource_class: windows.large
     shell: bash.exe --login -eo pipefail
+    environment:
+      MISE_ENV: ci,windows
 
 # We don't use {{ arch }} because on windows it is unstable https://discuss.circleci.com/t/value-of-arch-unstable-on-windows/40079
 parameters:
