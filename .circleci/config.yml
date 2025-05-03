@@ -13,7 +13,7 @@ executors:
   amd_linux_build: &amd_linux_build_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
-    resource_class: xlarge
+    resource_class: medium
     environment:
       CARGO_BUILD_JOBS: 4
       RUST_TEST_THREADS: 6
@@ -27,19 +27,19 @@ executors:
       - image: cimg/redis:7.4.2
       - image: openzipkin/zipkin:3.5.0
       - image: ghcr.io/datadog/dd-apm-test-agent/ddapm-test-agent:v1.21.1
-    resource_class: 2xlarge
+    resource_class: medium
     environment:
       CARGO_BUILD_JOBS: 4
   arm_linux_build: &arm_linux_build_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
-    resource_class: arm.xlarge
+    resource_class: arm.medium
     environment:
       CARGO_BUILD_JOBS: 8
   arm_linux_test: &arm_linux_test_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
-    resource_class: arm.xlarge
+    resource_class: arm.medium
     environment:
       CARGO_BUILD_JOBS: 8
   macos_build: &macos_build_executor
@@ -59,12 +59,12 @@ executors:
   windows_build: &windows_build_executor
     machine:
       image: "windows-server-2019-vs2019:2024.02.21"
-    resource_class: windows.xlarge
+    resource_class: windows.medium
     shell: bash.exe --login -eo pipefail
   windows_test: &windows_test_executor
     machine:
       image: "windows-server-2019-vs2019:2024.02.21"
-    resource_class: windows.xlarge
+    resource_class: windows.medium
     shell: bash.exe --login -eo pipefail
 
 # We don't use {{ arch }} because on windows it is unstable https://discuss.circleci.com/t/value-of-arch-unstable-on-windows/40079
