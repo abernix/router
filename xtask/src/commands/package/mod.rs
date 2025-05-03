@@ -12,6 +12,7 @@ use camino::Utf8PathBuf;
 use xtask::*;
 
 const INCLUDE: &[&str] = &["README.md", "LICENSE", "licenses.html"];
+const JSON_SCHEMA_FILE: &str = "config-schema.json";
 
 pub(crate) const TARGET_X86_64_MUSL_LINUX: &str = "x86_64-unknown-linux-musl";
 pub(crate) const TARGET_X86_64_GNU_LINUX: &str = "x86_64-unknown-linux-gnu";
@@ -50,6 +51,28 @@ impl Package {
             release_path
         );
 
+        // We want to get the JSONSchema from the binary, which we can obtain
+        // by running the binary with two positional arguments: `config` and `schema`
+        // which will return the JSONSchema to stdout.  We want that to actually be
+        // written to a file called `config-schema.json` in the current directory.
+        let schema_output = std::process::Command::new(&release_path)
+            .args(["config", "schema"])
+            .output()
+            .context("Failed to execute binary to get JSONSchema")?;
+
+        if !schema_output.status.success() {
+            return Err(anyhow::anyhow!(
+                "Failed to get JSONSchema: {}",
+                String::from_utf8_lossy(&schema_output.stderr)
+            ));
+        }
+
+        let schema_path = Path::new(JSON_SCHEMA_FILE);
+        std::fs::write(schema_path, &schema_output.stdout)
+            .context(format!("Failed to write {}", JSON_SCHEMA_FILE))?;
+
+        eprintln!("Generated JSONSchema at: {}", schema_path.display());
+
         #[cfg(target_os = "macos")]
         self.macos.run(&release_path)?;
 
@@ -75,27 +98,38 @@ impl Package {
             flate2::Compression::default(),
         );
         let mut ar = tar::Builder::new(&mut file);
-        eprintln!("Adding {release_path}...");
-        ar.append_file(
-            Path::new("dist").join(RELEASE_BIN),
-            &mut std::fs::File::open(release_path).context("could not open binary")?,
-        )
-        .context("could not add file to TGZ archive")?;
 
+        // Add the binary
+        add_file_to_archive(&mut ar, &release_path, RELEASE_BIN)?;
+
+        // Add the included files
         for path in INCLUDE {
-            eprintln!("Adding {path}...");
-            ar.append_file(
-                Path::new("dist").join(path),
-                &mut std::fs::File::open(PKG_PROJECT_ROOT.join(path))
-                    .context("could not open binary")?,
-            )
-            .context("could not add file to TGZ archive")?;
+            add_file_to_archive(&mut ar, &PKG_PROJECT_ROOT.join(path), path)?;
         }
+
+        // Add the JSON Schema file
+        add_file_to_archive(&mut ar, JSON_SCHEMA_FILE, JSON_SCHEMA_FILE)?;
 
         ar.finish().context("could not finish TGZ archive")?;
 
         Ok(())
     }
+}
+
+// Helper function to add a file to the archive
+fn add_file_to_archive<P: AsRef<Path>, W: std::io::Write>(
+    ar: &mut tar::Builder<W>,
+    source_path: P,
+    archive_name: &str,
+) -> Result<()> {
+    eprintln!("Adding {archive_name}...");
+    ar.append_file(
+        Path::new("dist").join(archive_name),
+        &mut std::fs::File::open(source_path.as_ref())
+            .context(format!("could not open {}", source_path.as_ref().display()))?,
+    )
+    .context(format!("could not add {} to TGZ archive", archive_name))?;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Clone, clap::ValueEnum)]
