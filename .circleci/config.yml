@@ -71,20 +71,13 @@ executors:
 parameters:
   toolchain_version:
     type: string
-    default: '{{ checksum ".circleci/config.yml" }}-v3-{{ checksum "~/.arch" }}-{{ checksum "rust-toolchain.toml" }}-{{ checksum "~/.daily_version" }}'
+    default: '{{ checksum ".circleci/config.yml" }}-v3-{{ checksum "~/.arch" }}-{{ checksum "rust-toolchain.toml" }}-{{ checksum "~/.daily_version" }}-{{ checksum ".config/mise/config.toml" }}'
   xtask_version:
     type: string
-    default: '{{ checksum ".circleci/config.yml" }}-v3-{{ checksum "~/.arch" }}-{{ checksum "rust-toolchain.toml" }}-{{ checksum "~/.xtask_version" }}'
+    default: '{{ checksum ".circleci/config.yml" }}-v3-{{ checksum "~/.arch" }}-{{ checksum "rust-toolchain.toml" }}-{{ checksum "~/.xtask_version" }}-{{ checksum ".config/mise/config.toml" }}'
   merge_version:
     type: string
-    default: '{{ checksum ".circleci/config.yml" }}-v3-{{ checksum "~/.arch" }}-{{ checksum "rust-toolchain.toml" }}-{{ checksum "~/.xtask_version" }}-{{ checksum "~/.merge_version" }}'
-  protoc_version:
-    type: string
-    default: "21.8"
-  # note the cmake version is only used for manual installs, not for installs from a package manager like apt or homebrew
-  cmake_version:
-    type: string
-    default: "3.31.1"
+    default: '{{ checksum ".circleci/config.yml" }}-v3-{{ checksum "~/.arch" }}-{{ checksum "rust-toolchain.toml" }}-{{ checksum "~/.xtask_version" }}-{{ checksum "~/.merge_version" }}-{{ checksum ".config/mise/config.toml" }}'
   nightly:
     type: boolean
     default: false
@@ -119,20 +112,17 @@ commands:
       - restore_cache:
           keys:
             - "<< pipeline.parameters.toolchain_version >>"
+      - install_mise:
+          platform: << parameters.platform >>
       - install_packages:
           platform: << parameters.platform >>
-      - install_protoc:
-          platform: << parameters.platform >>
-      - install_rust:
-          platform: << parameters.platform >>
-      - install_extra_tools
-      - fetch_dependencies
       - save_cache:
           key: "<< pipeline.parameters.toolchain_version >>"
           paths:
             - ~/.cargo
             - ~/.rustup
             - ~/.local
+            - ~/.mise
       - install_xtask
 
   # Even though all executors use bash there are a number of differences that can be taken care of up front.
@@ -323,53 +313,16 @@ commands:
               - equal: [ *windows_test_executor, << parameters.platform >> ]
           steps:
             - run:
-                name: Special case for Windows because of ssh-agent
+                name: Install CMake via mise
                 command: |
-                  printf "[net]\ngit-fetch-with-cli = true" >> ~/.cargo/Cargo.toml
-      - when:
-          condition:
-            or:
-              - equal: [ *macos_build_executor, << parameters.platform >> ]
-          steps:
-            - run:
-                name: Special case for OSX x86_64 builds
-                command: |
-                  rustup target add x86_64-apple-darwin
-
-      - when:
-          condition:
-            equal: [ *arm_linux_test_executor, << parameters.platform >> ]
-          steps:
-            - run:
-                name: Install nightly Rust to build the fuzzers
-                command: |
-                  rustup install nightly
-
-  install_extra_tools:
-    steps:
-      - run:
-          name: Install cargo deny, about, edit
-          command: |
-            if [[ ! -f "$HOME/.cargo/bin/cargo-binstall$EXECUTABLE_SUFFIX" ]]; then
-              curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-            fi
-
-            if [[ ! -f "$HOME/.cargo/bin/cargo-deny$EXECUTABLE_SUFFIX" ]]; then
-              cargo binstall -y --version 0.18.2 cargo-deny
-              cargo binstall -y --version 0.12.2 cargo-edit
-              cargo binstall -y --version 0.12.0 cargo-fuzz
-              cargo binstall -y --version 0.6.6 cargo-about
-            fi
-
-            if [[ ! -f "$HOME/.cargo/bin/cargo-nextest$EXECUTABLE_SUFFIX" ]]; then
-              cargo binstall -y --version 0.9.70 cargo-nextest
-            fi
+                  mise use cmake
 
   fetch_dependencies:
     steps:
       - run:
           name: Fetch dependencies
           command: cargo fetch --locked
+
   install_xtask:
     steps:
       - restore_cache:
@@ -410,12 +363,8 @@ commands:
       - run:
           name: Validate helm manifests
           command: |
-            # Install Helm
-            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-            # Install kubeconform
-            KUBECONFORM_INSTALL=$(mktemp -d)
-            curl -L https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz -C "${KUBECONFORM_INSTALL}"
+            # Use mise to ensure we have helm and other tools
+            mise use
 
             # Create list of kube versions
             CURRENT_KUBE_VERSIONS=$(curl -s -L https://raw.githubusercontent.com/kubernetes/website/main/data/releases/schedule.yaml \
@@ -451,7 +400,7 @@ commands:
               helm template --kube-version "${kube_version}" router helm/chart/router --set autoscaling.enabled=true > "${TEMPLATE_DIR}/router-${kube_version}.yaml"
 
               # Execute kubeconform on our templated charts to ensure they are good
-              "${KUBECONFORM_INSTALL}/kubeconform" \
+              kubeconform \
                 --kubernetes-version "${kube_version}" \
                 --strict \
                 --schema-location default \
@@ -542,6 +491,8 @@ jobs:
             equal: [ *amd_linux_helm_executor, << parameters.platform >> ]
           steps:
             - checkout
+            - setup_environment:
+                platform: << parameters.platform >>
             - xtask_check_helm
 
   check_compliance:
@@ -743,18 +694,10 @@ jobs:
               - equal: [ true, << parameters.nightly >> ]
           steps:
             - run:
-                name: Helm install
+                name: Use mise for helm and helm-docs installation
                 command: |
-                  # Install Helm
-                  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-            - run:
-                name: helm-docs install
-                command: |
-                  # install golang (to ${HOME}/go)
-                  curl -OLs https://go.dev/dl/go1.21.3.linux-amd64.tar.gz
-                  tar -C "${HOME}" -xf go1.21.3.linux-amd64.tar.gz
-                  # install helm-docs
-                  PATH="${HOME}/go/bin" GOPATH="${HOME}/.local" GO111MODULE=on go install github.com/norwoodj/helm-docs/cmd/helm-docs@latest
+                  # Install tools using mise
+                  mise use
       - when:
           condition:
             or:
@@ -842,6 +785,9 @@ jobs:
             - run:
                 name: Helm build
                 command: |
+                  # Use mise to ensure helm is available
+                  mise use
+
                   # Package up the helm chart
                   helm package helm/chart/router
                   # Make sure we have the newest chart
@@ -932,6 +878,8 @@ jobs:
             equal: [ "https://github.com/apollographql/router", << pipeline.project.git_url >> ]
           steps:
             - checkout
+            - setup_environment:
+                platform: amd_linux_build
             - setup_remote_docker:
                 # CircleCI Image Policy
                 #   https://circleci.com/docs/remote-docker-images-support-policy/
@@ -965,6 +913,9 @@ jobs:
             - run:
                 name: Docker build
                 command: |
+                  # Install any tools needed using mise
+                  mise use
+
                   ROUTER_TAG=ghcr.io/apollographql/router
                   # Create a multi-arch builder which works properly under qemu
                   docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
@@ -984,8 +935,9 @@ jobs:
             - run:
                 name: Helm build
                 command: |
-                  # Install Helm
-                  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+                  # Ensure helm is available through mise
+                  mise use
+
                   # Package up the helm chart
                   helm package helm/chart/router
                   # Make sure we have the newest chart
