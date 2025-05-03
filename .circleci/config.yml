@@ -13,21 +13,21 @@ executors:
   amd_linux_build: &amd_linux_build_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
-    resource_class: medium
+    resource_class: large
     environment:
       CARGO_BUILD_JOBS: 4
       RUST_TEST_THREADS: 6
   amd_linux_helm: &amd_linux_helm_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
-    resource_class: small
+    resource_class: large
   amd_linux_test: &amd_linux_test_executor
     docker:
       - image: ghcr.io/apollographql/ci-utility-docker-images/apollo-rust-builder:0.1.0
       - image: cimg/redis:7.4.2
       - image: openzipkin/zipkin:3.5.0
       - image: ghcr.io/datadog/dd-apm-test-agent/ddapm-test-agent:v1.21.1
-    resource_class: medium
+    resource_class: large
     environment:
       CARGO_BUILD_JOBS: 4
   arm_linux_build: &arm_linux_build_executor
@@ -59,12 +59,12 @@ executors:
   windows_build: &windows_build_executor
     machine:
       image: "windows-server-2019-vs2019:2024.02.21"
-    resource_class: windows.medium
+    resource_class: windows.large
     shell: bash.exe --login -eo pipefail
   windows_test: &windows_test_executor
     machine:
       image: "windows-server-2019-vs2019:2024.02.21"
-    resource_class: windows.medium
+    resource_class: windows.large
     shell: bash.exe --login -eo pipefail
 
 # We don't use {{ arch }} because on windows it is unstable https://discuss.circleci.com/t/value-of-arch-unstable-on-windows/40079
