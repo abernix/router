@@ -134,7 +134,7 @@ commands:
     steps:
       - run:
           name: Setup path
-          command: echo 'export PATH="$HOME/.local/bin:$HOME/.local/aliases:$HOME/.mise/bin:$PATH"' >> "$BASH_ENV"
+          command: echo 'export PATH="$HOME/.local/bin:$HOME/.local/aliases:$PATH"' >> "$BASH_ENV"
       - when:
           condition:
             or:
