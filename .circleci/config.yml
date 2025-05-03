@@ -292,7 +292,7 @@ commands:
       - restore_cache:
           keys:
             - "<< pipeline.parameters.merge_version >>-lint"
-      - run: xtask lint
+      - run: ~/.cargo/bin/xtask lint
       - when:
           condition:
             equal: [ "dev", "<< pipeline.git.branch >>" ]
