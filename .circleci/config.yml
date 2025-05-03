@@ -232,6 +232,7 @@ commands:
       - when:
           condition:
             or:
+              - equal: [ *amd_linux_helm_executor, << parameters.platform >> ]
               - equal: [ *amd_linux_build_executor, << parameters.platform >> ]
               - equal: [ *amd_linux_test_executor, << parameters.platform >> ]
               - equal: [ *arm_linux_build_executor, << parameters.platform >> ]
