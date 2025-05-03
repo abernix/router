@@ -128,8 +128,6 @@ commands:
             - "<< pipeline.parameters.toolchain_version >>"
       - install_mise:
           platform: << parameters.platform >>
-      - install_packages:
-          platform: << parameters.platform >>
       - save_cache:
           key: "<< pipeline.parameters.toolchain_version >>"
           paths:
@@ -265,23 +263,6 @@ commands:
                   scoop install mise
                   mise trust
                   mise install --yes
-  # Platform-specific package installations
-  install_packages:
-    parameters:
-      platform:
-        type: executor
-    steps:
-      - when:
-          condition:
-            or:
-              - equal: [ *windows_build_executor, << parameters.platform >> ]
-              - equal: [ *windows_test_executor, << parameters.platform >> ]
-          steps:
-            - run:
-                name: Install CMake via mise
-                command: |
-                  mise use cmake
-
   fetch_dependencies:
     steps:
       - run:
