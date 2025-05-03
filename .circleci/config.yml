@@ -122,7 +122,6 @@ commands:
             - ~/.cargo
             - ~/.rustup
             - ~/.local
-            - ~/.mise
       - install_xtask
 
   # Even though all executors use bash there are a number of differences that can be taken care of up front.
@@ -135,7 +134,7 @@ commands:
     steps:
       - run:
           name: Setup path
-          command: echo 'export PATH="$HOME/.local/bin:$HOME/.local/aliases:$PATH"' >> "$BASH_ENV"
+          command: echo 'export PATH="$HOME/.local/bin:$HOME/.local/aliases:$HOME/.mise/bin:$PATH"' >> "$BASH_ENV"
       - when:
           condition:
             or:
@@ -215,10 +214,7 @@ commands:
       - run:
           name: Install mise
           command: |
-            if [[ ! -d "$HOME/.mise" ]]; then
-              curl https://mise.jdx.dev/install.sh | sh
-            fi
-            export PATH="$HOME/.mise/bin:$PATH"
+            curl https://mise.jdx.dev/install.sh | sh
             mise activate bash >> "$BASH_ENV"
             mise trust
             mise install --yes
