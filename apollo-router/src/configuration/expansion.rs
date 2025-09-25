@@ -32,6 +32,8 @@ pub(crate) struct Override {
     value: Option<Value>,
     /// The type of the value, used to coerce env variables.
     value_type: ValueType,
+    /// Whether this is a dev mode default that should only apply if not already configured
+    is_dev_mode_default: Option<bool>,
     #[cfg(test)]
     mocked_env_vars: HashMap<String, String>,
 }
@@ -165,36 +167,43 @@ fn dev_mode_defaults() -> Vec<Override> {
             .config_path("plugins.[\"experimental.expose_query_plan\"]")
             .value(true)
             .value_type(ValueType::Bool)
+            .is_dev_mode_default(true)
             .build(),
         Override::builder()
             .config_path("include_subgraph_errors.all")
             .value(true)
             .value_type(ValueType::Bool)
+            .is_dev_mode_default(true)
             .build(),
         Override::builder()
             .config_path("telemetry.exporters.tracing.experimental_response_trace_id.enabled")
             .value(true)
             .value_type(ValueType::Bool)
+            .is_dev_mode_default(true)
             .build(),
         Override::builder()
             .config_path("supergraph.introspection")
             .value(true)
             .value_type(ValueType::Bool)
+            .is_dev_mode_default(true)
             .build(),
         Override::builder()
             .config_path("sandbox.enabled")
             .value(true)
             .value_type(ValueType::Bool)
+            .is_dev_mode_default(true)
             .build(),
         Override::builder()
             .config_path("homepage.enabled")
             .value(false)
             .value_type(ValueType::Bool)
+            .is_dev_mode_default(true)
             .build(),
         Override::builder()
             .config_path("connectors.debug_extensions")
             .value(true)
             .value_type(ValueType::Bool)
+            .is_dev_mode_default(true)
             .build(),
     ]
 }
@@ -269,6 +278,17 @@ impl Expansion {
         transformer_builder = transformer_builder.add_action(Parser::parse("", "")?);
         for override_config in &self.override_configs {
             if let Some(value) = override_config.value() {
+                // For dev mode defaults, only apply if the path doesn't already exist in the config
+                if override_config.is_dev_mode_default.unwrap_or(false) {
+                    let path_exists = jsonpath_lib::select(config, &format!("$.{}", override_config.config_path))
+                        .unwrap_or_default()
+                        .len() > 0;
+                    if path_exists {
+                        // Skip this override since the user has already configured this path
+                        continue;
+                    }
+                }
+                
                 transformer_builder = transformer_builder.add_action(Parser::parse(
                     &format!("const({value})"),
                     &override_config.config_path,
@@ -535,5 +555,27 @@ mod test {
         insta::with_settings!({sort_maps => true}, {
             assert_yaml_snapshot!(value);
         })
+    }
+
+    #[test]
+    fn test_dev_mode_should_not_override_user_config() {
+        let expansion = Expansion::builder()
+            .override_configs(dev_mode_defaults())
+            .build();
+        
+        // Test 1: User explicitly disables sandbox (should remain disabled)
+        let mut value = json!({"sandbox": {"enabled": false}});
+        value = expansion.expand(&value).expect("expansion must succeed");
+        assert_eq!(value["sandbox"]["enabled"], false);
+        
+        // Test 2: User explicitly enables homepage (should remain enabled, not overridden by dev mode default)
+        let mut value = json!({"homepage": {"enabled": true}});
+        value = expansion.expand(&value).expect("expansion must succeed");
+        assert_eq!(value["homepage"]["enabled"], true);
+        
+        // Test 3: User has not configured sandbox (should get dev mode default of true)
+        let mut value = json!({});
+        value = expansion.expand(&value).expect("expansion must succeed");
+        assert_eq!(value["sandbox"]["enabled"], true);
     }
 }
