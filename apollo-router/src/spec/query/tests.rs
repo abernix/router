@@ -7095,3 +7095,59 @@ fn filtered_defer_fragment() {
 
     assert_json_snapshot!(response);
 }
+
+// ---------------------------------------------------------------------------
+// ROUTER-1598 regression: null propagation must survive fragment merging
+// ---------------------------------------------------------------------------
+
+#[test]
+fn null_not_propagated_when_nonnull_field_is_null_across_fragments() {
+    // FragA selects product.review { body } (body is String! — non-null).
+    // body is null in the response, so review propagates to null.
+    // FragB also selects product.review { rating } (nullable).
+    // CollectFields merges both fragments before execution, so review is nullified
+    // exactly once.  FragB must NOT un-nullify review after the fact.
+    FormatTest::builder()
+        .schema(
+            "type Query { product: Product }
+             type Product { review: Review }
+             type Review { body: String! rating: Int }",
+        )
+        .fed2()
+        .query(
+            "{ product { ...WithBody ...WithRating } }
+             fragment WithBody on Product { review { body } }
+             fragment WithRating on Product { review { rating } }",
+        )
+        .response(json! {{
+            "product": { "review": { "__typename": "Review", "body": null, "rating": 5 } }
+        }})
+        .expected(json! {{
+            "product": { "review": null }
+        }})
+        .test();
+}
+
+#[test]
+fn null_propagation_result_is_independent_of_fragment_order() {
+    // Same scenario as above with fragments in reverse order — result must be identical.
+    FormatTest::builder()
+        .schema(
+            "type Query { product: Product }
+             type Product { review: Review }
+             type Review { body: String! rating: Int }",
+        )
+        .fed2()
+        .query(
+            "{ product { ...WithRating ...WithBody } }
+             fragment WithBody on Product { review { body } }
+             fragment WithRating on Product { review { rating } }",
+        )
+        .response(json! {{
+            "product": { "review": { "__typename": "Review", "body": null, "rating": 5 } }
+        }})
+        .expected(json! {{
+            "product": { "review": null }
+        }})
+        .test();
+}
