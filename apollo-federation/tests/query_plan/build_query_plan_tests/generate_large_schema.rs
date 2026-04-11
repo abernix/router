@@ -1154,6 +1154,45 @@ type OrderNotification {{
 "#)));
 
     // ============================================================
+    // SHAREABLE ZONE — three mirror subgraphs expose the same entity
+    // with @shareable fields. Queries selecting multiple of these
+    // fields force cost-based plan comparison because each field can
+    // be sourced from any of the three subgraphs, yielding 3^N plan
+    // candidates (capped by the planner's max_evaluated_plans budget).
+    // ============================================================
+    const SHAREABLE_BODY: &str = r#"
+type Query {
+  shareableRoot: ShareableEntity @shareable
+  shareableList(limit: Int = 10): [ShareableEntity!]! @shareable
+}
+
+type ShareableEntity @key(fields: "id") @shareable {
+  id: ID!
+  fieldA: String!
+  fieldB: String!
+  fieldC: String!
+  fieldD: String!
+  fieldE: String!
+  fieldF: String!
+  fieldG: String!
+  fieldH: String!
+  nested: ShareableNested!
+}
+
+type ShareableNested @shareable {
+  inner1: String!
+  inner2: String!
+  inner3: String!
+}
+"#;
+    for mirror in ["alpha", "beta", "gamma"] {
+        subgraphs.push((
+            format!("shareable_{mirror}"),
+            format!("extend schema {LINK}\n{SHAREABLE_BODY}"),
+        ));
+    }
+
+    // ============================================================
     // SCALED DEPARTMENT SUBGRAPHS — each adds types + cross-refs
     // ============================================================
     for i in 0..scale {
@@ -1452,6 +1491,38 @@ fn stress_mega_diamond(num_depts: usize) -> String {
     q
 }
 
+/// Stress query that selects N shareable fields from the shareable entity.
+/// Each field is resolvable from 3 mirror subgraphs, so the planner has
+/// 3^N candidate plans to evaluate (bounded by max_evaluated_plans = 10,000).
+fn stress_shareable_multi_plan(num_fields: usize) -> String {
+    let all_fields = [
+        "fieldA", "fieldB", "fieldC", "fieldD", "fieldE", "fieldF", "fieldG", "fieldH",
+    ];
+    let n = num_fields.min(all_fields.len());
+    let mut q = String::from("{ shareableRoot { id");
+    for f in &all_fields[..n] {
+        write!(q, " {f}").unwrap();
+    }
+    q.push_str(" } }");
+    q
+}
+
+/// Same but pulls from the list-returning shareable root — the list form
+/// may produce different plan enumeration because it goes through an
+/// entities jump rather than a scalar root.
+fn stress_shareable_list_multi_plan(num_fields: usize) -> String {
+    let all_fields = [
+        "fieldA", "fieldB", "fieldC", "fieldD", "fieldE", "fieldF", "fieldG", "fieldH",
+    ];
+    let n = num_fields.min(all_fields.len());
+    let mut q = String::from("{ shareableList { id");
+    for f in &all_fields[..n] {
+        write!(q, " {f}").unwrap();
+    }
+    q.push_str(" nested { inner1 inner2 inner3 } } }");
+    q
+}
+
 fn compose_with_rover(subgraphs: &[(String, String)]) -> String {
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_path = temp_dir.path();
@@ -1660,10 +1731,17 @@ fn measure_large_schema_cache_performance() {
             supergraph.lines().count()
         );
 
-        // Stress queries scale with dept count: each cross-cuts many @requires sites
+        // @requires-site stress: cross-cut many dept extensions on a single entity
         let product_stress = stress_product_cross_depts(num_depts);
         let user_stress = stress_user_cross_depts(num_depts);
         let mega = stress_mega_diamond(num_depts);
+
+        // Multi-plan stress: 3 shareable mirrors × N leaf fields → 3^N candidate plans.
+        // At N=8 the planner would consider 6561 plans, right below its 10k budget.
+        let shareable_small = stress_shareable_multi_plan(4); // 3^4 = 81
+        let shareable_medium = stress_shareable_multi_plan(6); // 3^6 = 729
+        let shareable_large = stress_shareable_multi_plan(8); // 3^8 = 6561
+        let shareable_list = stress_shareable_list_multi_plan(6);
 
         let mut queries: Vec<&str> = base_queries.to_vec();
         queries.push(&product_stress);
@@ -1671,14 +1749,18 @@ fn measure_large_schema_cache_performance() {
         queries.push(&mega);
         // Repeat mega to measure warm fan-out
         queries.push(&mega);
+        queries.push(&shareable_small);
+        queries.push(&shareable_medium);
+        queries.push(&shareable_large);
+        queries.push(&shareable_list);
 
         plan_and_measure(
-            &format!("{} subgraphs (13 core + {} dept)", subgraphs.len(), num_depts),
+            &format!("{} subgraphs (13 core + {} dept + 3 shareable)", subgraphs.len(), num_depts),
             &supergraph,
             &queries,
             iterations,
-            // Dump mega-diamond plan on the largest schema
-            if num_depts == 50 { Some(10) } else { None },
+            // Dump the shareable_large plan (index 14) — shows multi-plan cost selection
+            if num_depts == 50 { Some(14) } else { None },
         );
     }
 
