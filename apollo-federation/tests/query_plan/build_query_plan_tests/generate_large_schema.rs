@@ -2,8 +2,146 @@
 /// shared condition cache performance.
 ///
 /// Run with: USE_ROVER=1 cargo test -p apollo-federation -- generate_large_schema --nocapture
+use apollo_federation::query_plan::{PlanNode, QueryPlan, TopLevelPlanNode};
 use std::fmt::Write as FmtWrite;
 use std::time::Instant;
+
+/// Structural stats for a query plan — how complex is the plan actually?
+#[derive(Default, Debug, Clone, Copy)]
+struct PlanShape {
+    fetches: usize,
+    parallel_groups: usize,
+    sequence_groups: usize,
+    flatten_nodes: usize,
+    condition_nodes: usize,
+    defer_nodes: usize,
+    max_depth: usize,
+    // Max number of children in any single Parallel node (true fan-out width)
+    max_parallel_fan_out: usize,
+    // Distinct subgraphs fetched from
+    distinct_subgraphs: usize,
+}
+
+fn analyze_plan(plan: &QueryPlan) -> PlanShape {
+    let mut shape = PlanShape::default();
+    let mut subgraphs: std::collections::BTreeSet<String> = Default::default();
+    if let Some(node) = &plan.node {
+        walk_top(node, 1, &mut shape, &mut subgraphs);
+    }
+    shape.distinct_subgraphs = subgraphs.len();
+    shape
+}
+
+fn walk_top(
+    node: &TopLevelPlanNode,
+    depth: usize,
+    shape: &mut PlanShape,
+    subgraphs: &mut std::collections::BTreeSet<String>,
+) {
+    shape.max_depth = shape.max_depth.max(depth);
+    match node {
+        TopLevelPlanNode::Fetch(f) => {
+            shape.fetches += 1;
+            subgraphs.insert(f.subgraph_name.to_string());
+        }
+        TopLevelPlanNode::Sequence(s) => {
+            shape.sequence_groups += 1;
+            for n in &s.nodes {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+        }
+        TopLevelPlanNode::Parallel(p) => {
+            shape.parallel_groups += 1;
+            shape.max_parallel_fan_out = shape.max_parallel_fan_out.max(p.nodes.len());
+            for n in &p.nodes {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+        }
+        TopLevelPlanNode::Flatten(f) => {
+            shape.flatten_nodes += 1;
+            walk(&f.node, depth + 1, shape, subgraphs);
+        }
+        TopLevelPlanNode::Defer(d) => {
+            shape.defer_nodes += 1;
+            if let Some(n) = d.primary.node.as_deref() {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+            for db in &d.deferred {
+                if let Some(n) = db.node.as_deref() {
+                    walk(n, depth + 1, shape, subgraphs);
+                }
+            }
+        }
+        TopLevelPlanNode::Condition(c) => {
+            shape.condition_nodes += 1;
+            if let Some(n) = c.if_clause.as_deref() {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+            if let Some(n) = c.else_clause.as_deref() {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+        }
+        TopLevelPlanNode::Subscription(s) => {
+            shape.fetches += 1;
+            subgraphs.insert(s.primary.subgraph_name.to_string());
+            if let Some(n) = s.rest.as_deref() {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+        }
+    }
+}
+
+fn walk(
+    node: &PlanNode,
+    depth: usize,
+    shape: &mut PlanShape,
+    subgraphs: &mut std::collections::BTreeSet<String>,
+) {
+    shape.max_depth = shape.max_depth.max(depth);
+    match node {
+        PlanNode::Fetch(f) => {
+            shape.fetches += 1;
+            subgraphs.insert(f.subgraph_name.to_string());
+        }
+        PlanNode::Sequence(s) => {
+            shape.sequence_groups += 1;
+            for n in &s.nodes {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+        }
+        PlanNode::Parallel(p) => {
+            shape.parallel_groups += 1;
+            shape.max_parallel_fan_out = shape.max_parallel_fan_out.max(p.nodes.len());
+            for n in &p.nodes {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+        }
+        PlanNode::Flatten(f) => {
+            shape.flatten_nodes += 1;
+            walk(&f.node, depth + 1, shape, subgraphs);
+        }
+        PlanNode::Defer(d) => {
+            shape.defer_nodes += 1;
+            if let Some(n) = d.primary.node.as_deref() {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+            for db in &d.deferred {
+                if let Some(n) = db.node.as_deref() {
+                    walk(n, depth + 1, shape, subgraphs);
+                }
+            }
+        }
+        PlanNode::Condition(c) => {
+            shape.condition_nodes += 1;
+            if let Some(n) = c.if_clause.as_deref() {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+            if let Some(n) = c.else_clause.as_deref() {
+                walk(n, depth + 1, shape, subgraphs);
+            }
+        }
+    }
+}
 
 const LINK: &str = r#"@link(url: "https://specs.apollo.dev/federation/v2.9", import: ["@key", "@requires", "@provides", "@external", "@tag", "@extends", "@shareable", "@inaccessible", "@override", "@composeDirective", "@interfaceObject", "@context", "@fromContext", "@cost", "@listSize"])"#;
 
@@ -1235,6 +1373,85 @@ type Dept{prev}Item @key(fields: "id") {{
     subgraphs
 }
 
+/// Builds a query that asks for many department-contributed Product fields at once.
+/// Each `dept{i}Discount` carries `@requires(fields: "name price")` and each
+/// `dept{i}ShippingClass` (on even depts) carries `@requires(fields: "weight")`, so
+/// this forces the planner to reason about many parallel `@requires` sites sharing
+/// a common `name/price/weight` prefetch.
+fn stress_product_cross_depts(num_depts: usize) -> String {
+    let mut q = String::from("{ topProducts { upc name price weight salesRank dynamicPrice ");
+    for i in 0..num_depts {
+        write!(
+            q,
+            "dept{i}Available dept{i}Price dept{i}Discount "
+        )
+        .unwrap();
+        // Even-indexed depts also have @requires(weight) via dept{i}ShippingClass
+        if i % 2 == 0 {
+            write!(q, "dept{i}ShippingClass ").unwrap();
+        }
+    }
+    q.push_str("} }");
+    q
+}
+
+/// Builds a query that reaches into many department-contributed User fields at once.
+/// Every 3rd department has `dept{i}Preferences: Dept{i}UserPrefs @requires(name email)`
+/// and `dept{i}Score @requires(name)`; the rest have `dept{i}Preferences: [String!]!
+/// @requires(name)`. Cross-cutting them forces the planner to resolve many parallel
+/// `@requires` sites on the same User entity.
+fn stress_user_cross_depts(num_depts: usize) -> String {
+    let mut q = String::from("{ me { id name email role ");
+    for i in 0..num_depts {
+        if i % 3 == 0 {
+            // Object-returning preferences + score
+            write!(
+                q,
+                "dept{i}Preferences {{ favoriteCategories notifications priceRange {{ min max }} }} dept{i}Score "
+            )
+            .unwrap();
+        } else {
+            // Scalar-list preferences only
+            write!(q, "dept{i}Preferences ").unwrap();
+        }
+    }
+    q.push_str("} }");
+    q
+}
+
+/// Cross-subgraph diamond: single query pulls data for the same top-level entity
+/// set (topProducts) through analytics, pricing, inventory, reviews, AND dept{0..N}
+/// extensions simultaneously. Combined with the many-department pressure this is
+/// the worst-case single plan we can generate with this schema.
+fn stress_mega_diamond(num_depts: usize) -> String {
+    let mut q = String::from(
+        "{ topProducts { \
+         upc name price weight \
+         dimensions { length width height unit } \
+         brand { name country foundedYear } \
+         category { name parent { name parent { name } } } \
+         inStock stockCount inventoryValue shippingEstimate { standardDays standardCost expressDays expressCost } \
+         reviews { rating title body author { id name } } \
+         reviewCount averageRating \
+         salesRank viewCount conversionRate pricePerformanceScore trendDirection \
+         dynamicPrice competitorPriceIndex bundleDiscount discount { percentage absoluteAmount } \
+         priceHistory { price date source } \
+         ",
+    );
+    for i in 0..num_depts {
+        write!(
+            q,
+            "dept{i}Available dept{i}Price dept{i}Discount "
+        )
+        .unwrap();
+        if i % 2 == 0 {
+            write!(q, "dept{i}ShippingClass ").unwrap();
+        }
+    }
+    q.push_str("} }");
+    q
+}
+
 fn compose_with_rover(subgraphs: &[(String, String)]) -> String {
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_path = temp_dir.path();
@@ -1273,6 +1490,7 @@ fn plan_and_measure(
     supergraph_sdl: &str,
     queries: &[&str],
     iterations: usize,
+    dump_plan_for: Option<usize>,
 ) {
     let supergraph =
         apollo_federation::Supergraph::new(supergraph_sdl).expect("supergraph should be valid");
@@ -1286,8 +1504,22 @@ fn plan_and_measure(
     .expect("planner should be created");
 
     eprintln!("\n  === {label} ===");
+    eprintln!(
+        "    {:<62} {:>10} {:>10} {:>9} {:>7} {:>6} {:>5} {:>5} {:>4} {:>5} {:>7}",
+        "query",
+        "cold-µs",
+        "warm-µs",
+        "speed",
+        "paths",
+        "plans",
+        "ftch",
+        "subg",
+        "dep",
+        "par/s",
+        "fanOut"
+    );
 
-    for query_str in queries {
+    for (idx, query_str) in queries.iter().enumerate() {
         let doc = match apollo_compiler::ExecutableDocument::parse_and_validate(
             api_schema.schema(),
             *query_str,
@@ -1305,8 +1537,9 @@ fn plan_and_measure(
             }
         };
 
-        let mut timings = Vec::new();
-        for _ in 0..iterations {
+        let mut timings: Vec<(std::time::Duration, usize, usize, PlanShape)> = Vec::new();
+        let mut last_plan_str: Option<String> = None;
+        for i in 0..iterations {
             let start = Instant::now();
             let plan = planner
                 .build_query_plan(
@@ -1316,15 +1549,27 @@ fn plan_and_measure(
                 )
                 .expect("plan should succeed");
             let elapsed = start.elapsed();
-            timings.push((elapsed, plan.statistics.evaluated_plan_paths.get()));
+            let shape = analyze_plan(&plan);
+            timings.push((
+                elapsed,
+                plan.statistics.evaluated_plan_paths.get(),
+                plan.statistics.evaluated_plan_count.get(),
+                shape,
+            ));
+            if Some(idx) == dump_plan_for && i == 0 {
+                last_plan_str = Some(format!("{plan}"));
+            }
         }
 
         let cold = timings[0].0;
         let cold_paths = timings[0].1;
-        let warm_avg: std::time::Duration =
-            timings[1..].iter().map(|(d, _)| *d).sum::<std::time::Duration>()
-                / (timings.len() as u32 - 1);
-        let warm_paths = timings[1].1;
+        let cold_plans = timings[0].2;
+        let shape = timings[0].3;
+        let warm_avg: std::time::Duration = timings[1..]
+            .iter()
+            .map(|(d, _, _, _)| *d)
+            .sum::<std::time::Duration>()
+            / (timings.len() as u32 - 1);
         let speedup = cold.as_nanos() as f64 / warm_avg.as_nanos() as f64;
 
         let q_short = if query_str.len() > 60 {
@@ -1333,18 +1578,40 @@ fn plan_and_measure(
             query_str.to_string()
         };
         eprintln!(
-            "    [{:>60}] cold: {:>9}µs ({:>4} paths)  warm: {:>9}µs ({:>4} paths)  {:.2}x",
+            "    {:<62} {:>10} {:>10} {:>8.2}x {:>7} {:>6} {:>5} {:>5} {:>4} {:>5} {:>7}",
             q_short,
             cold.as_micros(),
-            cold_paths,
             warm_avg.as_micros(),
-            warm_paths,
             speedup,
+            cold_paths,
+            cold_plans,
+            shape.fetches,
+            shape.distinct_subgraphs,
+            shape.max_depth,
+            format!("{}/{}", shape.parallel_groups, shape.sequence_groups),
+            shape.max_parallel_fan_out,
         );
+
+        if let Some(plan_str) = last_plan_str {
+            eprintln!("\n    -- sample plan for query #{idx} --");
+            for line in plan_str.lines().take(120) {
+                eprintln!("    {line}");
+            }
+            if plan_str.lines().count() > 120 {
+                eprintln!(
+                    "    ... ({} more lines truncated)",
+                    plan_str.lines().count() - 120
+                );
+            }
+            eprintln!();
+        }
     }
     eprintln!(
         "    cache: {} entries",
         planner.condition_resolver_cache_len()
+    );
+    eprintln!(
+        "    legend: ftch=fetch nodes, subg=distinct subgraphs, dep=max depth, par/s=parallel/sequence groups, fanOut=max parallel children"
     );
 }
 
@@ -1363,10 +1630,11 @@ fn measure_large_schema_cache_performance() {
     let analytics_requires_chain = r#"{ topProducts { name price weight salesRank viewCount conversionRate pricePerformanceScore searchRelevanceScore shippingEfficiency trendDirection dynamicPrice competitorPriceIndex bundleDiscount discount { percentage absoluteAmount } priceHistory { price date source } } }"#;
     let search_union = r#"{ search(query: "laptop", limit: 5) { results { ... on ProductSearchHit { product { upc name price } relevanceScore highlights } ... on UserSearchHit { user { id name } } ... on BrandSearchHit { brand { name country } } ... on CategorySearchHit { category { name depth } } } totalCount facets { field values { value count } } } }"#;
     let shipping_deep_requires = r#"{ order(id: "1") { orderNumber status totalAmount items { product { name price inStock } quantity unitPrice customization { color size giftWrap } } shipments { trackingNumber carrier { name trackingUrl } status packages { weight dimensions { length width height } items { description quantity } } trackingEvents { status location timestamp } } shippingCost estimatedDelivery payment { method last4 transactionId } } }"#;
-    let dept_cross_refs = r#"{ dept0Items { name price metadata { label data { value confidence } } product { name dept0Discount dept0ShippingClass } suppliers { name leadTimeDays cost } } }"#;
+    // dept0 has nesting depth 2 — Dept0Metadata.data is Dept0Level1, Dept0Level1.data is Dept0Leaf
+    let dept_cross_refs = r#"{ dept0Items { name price metadata { label priority tags data { label priority data { value confidence source timestamp } } } product { upc name dept0Discount dept0ShippingClass dept0Available dept0Price } suppliers { name leadTimeDays cost reliability } } }"#;
     let user_full_profile = r#"{ me { name email username role profile { bio avatarUrl location { city state country coordinates { lat lng } } website socialLinks { twitter github linkedin } } settings { emailNotifications theme language timezone } addresses { label street city state zip country isDefault } engagementScore lifetimeValue churnRisk segmentId cohort { name size } loyaltyTier recommendedProducts { name price relatedProducts { name } } personalizedFeed { type content score reason } browsingHistory { productUpc viewedAt durationSeconds } notificationDigest { dailySummary weeklySummary preferredTime } } }"#;
 
-    let core_queries: &[&str] = &[
+    let base_queries: &[&str] = &[
         deep_cross_subgraph,
         wide_touch_many,
         analytics_requires_chain,
@@ -1378,73 +1646,41 @@ fn measure_large_schema_cache_performance() {
         deep_cross_subgraph,
     ];
 
-    // --- Scale 1: 23 subgraphs (13 core + 10 departments) ---
     eprintln!("\n--- Large Schema Cache Performance ---");
 
-    let subgraphs = generate_subgraphs(10);
-    eprintln!(
-        "  Composing {}-subgraph schema...",
-        subgraphs.len()
-    );
-    let start = Instant::now();
-    let supergraph = compose_with_rover(&subgraphs);
-    eprintln!(
-        "  Composed in {:?} ({} bytes, {} lines)",
-        start.elapsed(),
-        supergraph.len(),
-        supergraph.lines().count()
-    );
+    for num_depts in [10usize, 30, 50] {
+        let subgraphs = generate_subgraphs(num_depts);
+        eprintln!("\n  Composing {}-subgraph schema...", subgraphs.len());
+        let start = Instant::now();
+        let supergraph = compose_with_rover(&subgraphs);
+        eprintln!(
+            "  Composed in {:?} ({} bytes, {} lines)",
+            start.elapsed(),
+            supergraph.len(),
+            supergraph.lines().count()
+        );
 
-    plan_and_measure(
-        &format!("{} subgraphs (13 core + 10 dept)", subgraphs.len()),
-        &supergraph,
-        core_queries,
-        iterations,
-    );
+        // Stress queries scale with dept count: each cross-cuts many @requires sites
+        let product_stress = stress_product_cross_depts(num_depts);
+        let user_stress = stress_user_cross_depts(num_depts);
+        let mega = stress_mega_diamond(num_depts);
 
-    // --- Scale 2: 13 core + 30 departments ---
-    let subgraphs = generate_subgraphs(30);
-    eprintln!(
-        "\n  Composing {}-subgraph schema...",
-        subgraphs.len()
-    );
-    let start = Instant::now();
-    let supergraph = compose_with_rover(&subgraphs);
-    eprintln!(
-        "  Composed in {:?} ({} bytes, {} lines)",
-        start.elapsed(),
-        supergraph.len(),
-        supergraph.lines().count()
-    );
+        let mut queries: Vec<&str> = base_queries.to_vec();
+        queries.push(&product_stress);
+        queries.push(&user_stress);
+        queries.push(&mega);
+        // Repeat mega to measure warm fan-out
+        queries.push(&mega);
 
-    plan_and_measure(
-        &format!("{} subgraphs (13 core + 30 dept)", subgraphs.len()),
-        &supergraph,
-        core_queries,
-        iterations,
-    );
-
-    // --- Scale 3: 13 core + 50 departments ---
-    let subgraphs = generate_subgraphs(50);
-    eprintln!(
-        "\n  Composing {}-subgraph schema...",
-        subgraphs.len()
-    );
-    let start = Instant::now();
-    let supergraph = compose_with_rover(&subgraphs);
-    eprintln!(
-        "  Composed in {:?} ({} bytes, {} lines)",
-        start.elapsed(),
-        supergraph.len(),
-        supergraph.lines().count()
-    );
-
-    plan_and_measure(
-        &format!("{} subgraphs (13 core + 50 dept)", subgraphs.len()),
-        &supergraph,
-        core_queries,
-        iterations,
-    );
+        plan_and_measure(
+            &format!("{} subgraphs (13 core + {} dept)", subgraphs.len(), num_depts),
+            &supergraph,
+            &queries,
+            iterations,
+            // Dump mega-diamond plan on the largest schema
+            if num_depts == 50 { Some(10) } else { None },
+        );
+    }
 
     eprintln!("\n--- Done ---\n");
 }
