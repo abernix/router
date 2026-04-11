@@ -218,6 +218,25 @@ pub struct PhaseTimings {
     /// combinations (cartesian product over multi-option branches) with
     /// cost-based best-plan selection.
     pub best_plan_selection_ns: Cell<u128>,
+    /// Sub-sub-phase of `best_plan_selection_ns`: `sort_options_in_closed_branches`
+    /// + `reduce_options_if_needed`. Typically cheap unless the plan-option
+    /// fan-out approaches the `max_evaluated_plans` budget.
+    pub sel_sort_reduce_ns: Cell<u128>,
+    /// Sub-sub-phase of `best_plan_selection_ns`: build the initial `OpPathTree`
+    /// from single-choice branches + run `updated_dependency_graph` to
+    /// construct the initial `FetchDependencyGraph` + build the
+    /// per-multi-choice-branch `other_trees`. This is FDG construction work
+    /// that lives inside the "plan selection" phase rather than after it;
+    /// it dominates when the query has many fetches and few multi-option
+    /// branches.
+    pub sel_initial_build_ns: Cell<u128>,
+    /// Sub-sub-phase of `best_plan_selection_ns`: `generate_all_plans_and_find_best`
+    /// — the cartesian-product branch-and-bound over multi-option closed
+    /// branches, with cost-based pruning. Dominates when the query has
+    /// many candidate plans (e.g. `@shareable` fields with multiple
+    /// subgraph sources) but few fetches. Not entered at all on the
+    /// single-plan path.
+    pub sel_generate_plans_ns: Cell<u128>,
     /// Time spent in `FetchDependencyGraph::process`: `reduce_and_optimize`
     /// (fetch merging, transitive reduction) and conversion to the final
     /// `PlanNode` tree.

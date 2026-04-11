@@ -735,8 +735,15 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
         if self.closed_branches.is_empty() {
             return Ok(());
         }
+        let sort_reduce_start = std::time::Instant::now();
         self.sort_options_in_closed_branches()?;
         self.reduce_options_if_needed();
+        self.parameters
+            .statistics
+            .phase_timings
+            .sel_sort_reduce_ns
+            .set(sort_reduce_start.elapsed().as_nanos());
+        let initial_build_start = std::time::Instant::now();
 
         snapshot!(
             "ClosedBranches",
@@ -802,6 +809,11 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
             if first_group.is_empty() {
                 // Well, we have the only possible plan; it's also the best.
                 let cost = self.cost(&mut initial_dependency_graph)?;
+                self.parameters
+                    .statistics
+                    .phase_timings
+                    .sel_initial_build_ns
+                    .set(initial_build_start.elapsed().as_nanos());
                 let best_plan = BestQueryPlanInfo {
                     fetch_dependency_graph: initial_dependency_graph,
                     path_tree: initial_tree.into(),
@@ -842,7 +854,13 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
                     .collect()
             })
             .collect();
+        self.parameters
+            .statistics
+            .phase_timings
+            .sel_initial_build_ns
+            .set(initial_build_start.elapsed().as_nanos());
 
+        let generate_plans_start = std::time::Instant::now();
         let (best, cost) = generate_all_plans_and_find_best(
             PlanInfo {
                 fetch_dependency_graph: initial_dependency_graph,
@@ -851,6 +869,11 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
             other_trees,
             /*plan_builder*/ self,
         )?;
+        self.parameters
+            .statistics
+            .phase_timings
+            .sel_generate_plans_ns
+            .set(generate_plans_start.elapsed().as_nanos());
         let best_plan = BestQueryPlanInfo {
             fetch_dependency_graph: best.fetch_dependency_graph,
             path_tree: best.path_tree,

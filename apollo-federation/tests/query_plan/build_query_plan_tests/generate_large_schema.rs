@@ -1576,7 +1576,7 @@ fn plan_and_measure(
 
     eprintln!("\n  === {label} ===");
     eprintln!(
-        "    {:<48} {:>8} {:>8} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>23}",
+        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18}",
         "query",
         "cold-µs",
         "warm-µs",
@@ -1588,7 +1588,8 @@ fn plan_and_measure(
         "dep",
         "par/s",
         "fanOt",
-        "warm new/loop/sel/proc µs",
+        "warm new/loop/sel/prc",
+        "sel sr/build/plans",
     );
 
     for (idx, query_str) in queries.iter().enumerate() {
@@ -1609,17 +1610,18 @@ fn plan_and_measure(
             }
         };
 
-        // Each iteration: (wall, paths, plans, shape, new_ns, loop_ns, sel_ns, proc_ns)
-        let mut timings: Vec<(
-            std::time::Duration,
-            usize,
-            usize,
-            PlanShape,
-            u128,
-            u128,
-            u128,
-            u128,
-        )> = Vec::new();
+        // Each iteration collects (wall, paths, plans, shape, phase ns snapshot).
+        #[derive(Clone, Copy)]
+        struct Ns {
+            new: u128,
+            loop_: u128,
+            sel: u128,
+            proc: u128,
+            sel_sort_reduce: u128,
+            sel_initial_build: u128,
+            sel_generate_plans: u128,
+        }
+        let mut timings: Vec<(std::time::Duration, usize, usize, PlanShape, Ns)> = Vec::new();
         let mut last_plan_str: Option<String> = None;
         for i in 0..iterations {
             let start = Instant::now();
@@ -1633,15 +1635,21 @@ fn plan_and_measure(
             let elapsed = start.elapsed();
             let shape = analyze_plan(&plan);
             let pt = &plan.statistics.phase_timings;
+            let ns = Ns {
+                new: pt.traversal_new_ns.get(),
+                loop_: pt.open_branches_loop_ns.get(),
+                sel: pt.best_plan_selection_ns.get(),
+                proc: pt.dep_graph_process_ns.get(),
+                sel_sort_reduce: pt.sel_sort_reduce_ns.get(),
+                sel_initial_build: pt.sel_initial_build_ns.get(),
+                sel_generate_plans: pt.sel_generate_plans_ns.get(),
+            };
             timings.push((
                 elapsed,
                 plan.statistics.evaluated_plan_paths.get(),
                 plan.statistics.evaluated_plan_count.get(),
                 shape,
-                pt.traversal_new_ns.get(),
-                pt.open_branches_loop_ns.get(),
-                pt.best_plan_selection_ns.get(),
-                pt.dep_graph_process_ns.get(),
+                ns,
             ));
             if Some(idx) == dump_plan_for && i == 0 {
                 last_plan_str = Some(format!("{plan}"));
@@ -1655,42 +1663,33 @@ fn plan_and_measure(
         let warm_count = (timings.len() - 1) as u32;
         let warm_avg: std::time::Duration = timings[1..]
             .iter()
-            .map(|(d, _, _, _, _, _, _, _)| *d)
+            .map(|(d, _, _, _, _)| *d)
             .sum::<std::time::Duration>()
             / warm_count;
-        let warm_new_us: u128 = timings[1..]
-            .iter()
-            .map(|(_, _, _, _, n, _, _, _)| *n)
-            .sum::<u128>()
-            / warm_count as u128
-            / 1_000;
-        let warm_loop_us: u128 = timings[1..]
-            .iter()
-            .map(|(_, _, _, _, _, l, _, _)| *l)
-            .sum::<u128>()
-            / warm_count as u128
-            / 1_000;
-        let warm_sel_us: u128 = timings[1..]
-            .iter()
-            .map(|(_, _, _, _, _, _, s, _)| *s)
-            .sum::<u128>()
-            / warm_count as u128
-            / 1_000;
-        let warm_proc_us: u128 = timings[1..]
-            .iter()
-            .map(|(_, _, _, _, _, _, _, p)| *p)
-            .sum::<u128>()
-            / warm_count as u128
-            / 1_000;
+        let avg_us = |f: fn(&Ns) -> u128| -> u128 {
+            timings[1..]
+                .iter()
+                .map(|(_, _, _, _, n)| f(n))
+                .sum::<u128>()
+                / warm_count as u128
+                / 1_000
+        };
+        let warm_new_us = avg_us(|n| n.new);
+        let warm_loop_us = avg_us(|n| n.loop_);
+        let warm_sel_us = avg_us(|n| n.sel);
+        let warm_proc_us = avg_us(|n| n.proc);
+        let warm_sort_reduce_us = avg_us(|n| n.sel_sort_reduce);
+        let warm_initial_build_us = avg_us(|n| n.sel_initial_build);
+        let warm_generate_plans_us = avg_us(|n| n.sel_generate_plans);
         let speedup = cold.as_nanos() as f64 / warm_avg.as_nanos() as f64;
 
-        let q_short = if query_str.len() > 46 {
-            format!("{}...", &query_str[..43])
+        let q_short = if query_str.len() > 40 {
+            format!("{}...", &query_str[..37])
         } else {
             query_str.to_string()
         };
         eprintln!(
-            "    {:<48} {:>8} {:>8} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>23}",
+            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18}",
             q_short,
             cold.as_micros(),
             warm_avg.as_micros(),
@@ -1703,8 +1702,12 @@ fn plan_and_measure(
             format!("{}/{}", shape.parallel_groups, shape.sequence_groups),
             shape.max_parallel_fan_out,
             format!(
-                "{:>4}/{:>5}/{:>4}/{:>4}",
+                "{:>3}/{:>5}/{:>4}/{:>3}",
                 warm_new_us, warm_loop_us, warm_sel_us, warm_proc_us
+            ),
+            format!(
+                "{:>3}/{:>5}/{:>5}",
+                warm_sort_reduce_us, warm_initial_build_us, warm_generate_plans_us
             ),
         );
 
@@ -1730,7 +1733,10 @@ fn plan_and_measure(
         "    legend: ftc=fetch nodes, sub=distinct subgraphs, dep=max depth, par/s=parallel/sequence groups, fanOt=max parallel children"
     );
     eprintln!(
-        "            new/loop/sel/proc = warm-avg phase timings in µs (traversal::new / open-branches loop / best-plan selection / dep-graph process)"
+        "            new/loop/sel/prc = warm-avg µs (traversal::new / open-branches loop / best-plan selection / dep-graph process)"
+    );
+    eprintln!(
+        "            sr/build/plans   = sub-breakdown of sel: sort+reduce / initial-tree-and-FDG-build / generate_all_plans_and_find_best"
     );
 }
 
