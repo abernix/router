@@ -1576,7 +1576,7 @@ fn plan_and_measure(
 
     eprintln!("\n  === {label} ===");
     eprintln!(
-        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20}",
+        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20}",
         "query",
         "cold-µs",
         "warm-µs",
@@ -1591,6 +1591,7 @@ fn plan_and_measure(
         "warm new/loop/sel/prc",
         "sel sr/build/plans",
         "build opt/dep/ot",
+        "probe tot/perm/strict",
     );
 
     for (idx, query_str) in queries.iter().enumerate() {
@@ -1624,6 +1625,9 @@ fn plan_and_measure(
             sel_op_path_tree: u128,
             sel_updated_dep_graph: u128,
             sel_other_trees: u128,
+            probe_total: u128,
+            probe_permissive_repeats: u128,
+            probe_strict_repeats: u128,
         }
         let mut timings: Vec<(std::time::Duration, usize, usize, PlanShape, Ns)> = Vec::new();
         let mut last_plan_str: Option<String> = None;
@@ -1650,6 +1654,9 @@ fn plan_and_measure(
                 sel_op_path_tree: pt.sel_op_path_tree_ns.get(),
                 sel_updated_dep_graph: pt.sel_updated_dep_graph_ns.get(),
                 sel_other_trees: pt.sel_other_trees_ns.get(),
+                probe_total: pt.indirect_probe_total.get(),
+                probe_permissive_repeats: pt.indirect_probe_permissive_repeats.get(),
+                probe_strict_repeats: pt.indirect_probe_strict_repeats.get(),
             };
             timings.push((
                 elapsed,
@@ -1691,6 +1698,16 @@ fn plan_and_measure(
         let warm_op_path_tree_us = avg_us(|n| n.sel_op_path_tree);
         let warm_updated_dep_graph_us = avg_us(|n| n.sel_updated_dep_graph);
         let warm_other_trees_us = avg_us(|n| n.sel_other_trees);
+        let avg_count = |f: fn(&Ns) -> u128| -> u128 {
+            timings[1..]
+                .iter()
+                .map(|(_, _, _, _, n)| f(n))
+                .sum::<u128>()
+                / warm_count as u128
+        };
+        let warm_probe_total = avg_count(|n| n.probe_total);
+        let warm_probe_permissive = avg_count(|n| n.probe_permissive_repeats);
+        let warm_probe_strict = avg_count(|n| n.probe_strict_repeats);
         let speedup = cold.as_nanos() as f64 / warm_avg.as_nanos() as f64;
 
         let q_short = if query_str.len() > 40 {
@@ -1699,7 +1716,7 @@ fn plan_and_measure(
             query_str.to_string()
         };
         eprintln!(
-            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20}",
+            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20}",
             q_short,
             cold.as_micros(),
             warm_avg.as_micros(),
@@ -1722,6 +1739,10 @@ fn plan_and_measure(
             format!(
                 "{:>5}/{:>5}/{:>5}",
                 warm_op_path_tree_us, warm_updated_dep_graph_us, warm_other_trees_us
+            ),
+            format!(
+                "{}/{}/{}",
+                warm_probe_total, warm_probe_permissive, warm_probe_strict
             ),
         );
 

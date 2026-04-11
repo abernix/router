@@ -267,6 +267,21 @@ impl Default for ExcludedDestinations {
     }
 }
 
+impl ExcludedDestinations {
+    /// Order-independent semantic hash used by the
+    /// `indirect_paths_probe` instrumentation.
+    pub(crate) fn probe_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        let mut names: Vec<&str> = self.0.iter().map(|a| a.as_ref()).collect();
+        names.sort_unstable();
+        let mut h = DefaultHasher::new();
+        names.hash(&mut h);
+        h.finish()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct ExcludedConditions(Arc<Vec<Arc<SelectionSet>>>);
 
@@ -293,6 +308,24 @@ impl ExcludedConditions {
 impl Default for ExcludedConditions {
     fn default() -> Self {
         ExcludedConditions(Arc::new(vec![]))
+    }
+}
+
+impl ExcludedConditions {
+    /// Pointer-identity hash used by the `indirect_paths_probe`
+    /// instrumentation. This is sound for a probe because a caller with
+    /// *semantically* equivalent but differently-allocated selection sets
+    /// will produce a false miss — that just gives a tighter lower bound on
+    /// the achievable hit rate, which is what we want to measure.
+    pub(crate) fn probe_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        let mut ptrs: Vec<usize> = self.0.iter().map(|a| Arc::as_ptr(a) as usize).collect();
+        ptrs.sort_unstable();
+        let mut h = DefaultHasher::new();
+        ptrs.hash(&mut h);
+        h.finish()
     }
 }
 
@@ -944,6 +977,83 @@ where
 
     pub(crate) fn tail_node(&self) -> Result<&QueryGraphNode, FederationError> {
         self.graph.node_weight(self.tail)
+    }
+
+    /// Compute `(permissive, strict)` fingerprints of this path for the
+    /// `indirect_paths_probe` instrumentation (see
+    /// `query_plan::indirect_paths_probe` for the motivation).
+    ///
+    /// `context_hash`, `excluded_destinations_hash`, and
+    /// `excluded_conditions_hash` must be stable, semantic hashes computed by
+    /// the caller — they capture the non-path inputs to
+    /// `compute_indirect_paths`.
+    ///
+    /// * The **permissive** key treats the Dijkstra as if it had no prefix
+    ///   dependence: `(tail, defer_on_tail.is_some(), context, excluded_destinations, excluded_conditions)`.
+    ///   Upper bound on the hit rate a semantic cache at this layer could
+    ///   reach.
+    ///
+    /// * The **strict** key extends permissive with the prefix state the
+    ///   Dijkstra in
+    ///   `advance_with_non_collecting_and_type_preserving_transitions`
+    ///   actually reads: `head`, `last_subgraph_entering_edge_info` (index +
+    ///   cost), the edge suffix from that index onward, and
+    ///   `runtime_types_of_tail`. Lower bound on the hit rate a
+    ///   correctness-preserving cache at this layer could reach.
+    pub(crate) fn indirect_paths_probe_fingerprints(
+        &self,
+        context_hash: u64,
+        excluded_destinations_hash: u64,
+        excluded_conditions_hash: u64,
+    ) -> (u64, u64) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hash;
+        use std::hash::Hasher;
+
+        // Permissive key.
+        let mut h = DefaultHasher::new();
+        self.tail.index().hash(&mut h);
+        self.defer_on_tail.is_some().hash(&mut h);
+        context_hash.hash(&mut h);
+        excluded_destinations_hash.hash(&mut h);
+        excluded_conditions_hash.hash(&mut h);
+        let permissive = h.finish();
+
+        // Strict key.
+        let mut h = DefaultHasher::new();
+        permissive.hash(&mut h);
+        self.head.index().hash(&mut h);
+        match &self.last_subgraph_entering_edge_info {
+            Some(info) => {
+                1u8.hash(&mut h);
+                info.index.hash(&mut h);
+                info.conditions_cost.to_bits().hash(&mut h);
+                // The detour-detection logic (graph_path.rs:1714+) iterates
+                // the path suffix from `info.index` onward, so two paths
+                // with different suffixes must get different strict keys.
+                for edge in &self.edges[info.index..] {
+                    let opt: Option<EdgeIndex> = (*edge).into();
+                    opt.map(|e| e.index()).hash(&mut h);
+                }
+            }
+            None => {
+                0u8.hash(&mut h);
+            }
+        }
+        // Runtime types of tail. Sorted by name to be insertion-order
+        // independent (an `IndexSet` preserves insertion order, and two paths
+        // reaching the same tail via different routes could legitimately end
+        // up with the same set but in different orders).
+        let mut runtime_type_names: Vec<&str> = self
+            .runtime_types_of_tail
+            .iter()
+            .map(|t| t.type_name.as_str())
+            .collect();
+        runtime_type_names.sort_unstable();
+        runtime_type_names.hash(&mut h);
+        let strict = h.finish();
+
+        (permissive, strict)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = GraphPathItem<'_, TTrigger, TEdge>> {

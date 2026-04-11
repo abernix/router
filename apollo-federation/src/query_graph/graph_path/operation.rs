@@ -1963,6 +1963,29 @@ impl SimultaneousPathsWithLazyIndirectPaths {
         override_conditions: &OverrideConditions,
         disabled_subgraphs: &IndexSet<Arc<str>>,
     ) -> Result<OpIndirectPaths, FederationError> {
+        // Instrumentation-only: record the prospective semantic fingerprints
+        // of this `compute_indirect_paths` invocation against the active
+        // traversal-wide probe (see `query_plan::indirect_paths_probe`).
+        // This is a no-op unless the probe has been activated by the
+        // traversal. Recording happens on the lazy-cache miss path only —
+        // the per-instance `lazily_computed_indirect_paths` already catches
+        // repeats against the same instance; the probe measures
+        // *cross-instance* semantic reuse opportunity within one traversal.
+        if crate::query_plan::indirect_paths_probe::is_active() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::Hash;
+            use std::hash::Hasher;
+            let mut ctx_hasher = DefaultHasher::new();
+            self.context.hash(&mut ctx_hasher);
+            let context_hash = ctx_hasher.finish();
+            let (permissive, strict) = self.paths.0[path_index]
+                .indirect_paths_probe_fingerprints(
+                    context_hash,
+                    self.excluded_destinations.probe_hash(),
+                    self.excluded_conditions.probe_hash(),
+                );
+            crate::query_plan::indirect_paths_probe::record(permissive, strict);
+        }
         self.paths.0[path_index].advance_with_non_collecting_and_type_preserving_transitions(
             &self.context,
             condition_resolver,

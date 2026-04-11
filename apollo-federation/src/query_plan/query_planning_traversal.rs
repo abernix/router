@@ -360,6 +360,10 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
         )
     )]
     fn find_best_plan_inner(&mut self) -> Result<Option<&BestQueryPlanInfo>, FederationError> {
+        // Activate the traversal-wide `compute_indirect_paths` what-if probe
+        // for the duration of the open-branches loop. Deactivated below
+        // after the loop exits so the counts reflect only this traversal.
+        crate::query_plan::indirect_paths_probe::activate();
         let open_loop_start = std::time::Instant::now();
         while !self.open_branches.is_empty() {
             self.parameters.check_cancellation()?;
@@ -400,6 +404,14 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
             .phase_timings
             .open_branches_loop_ns
             .set(open_loop_start.elapsed().as_nanos());
+        if let Some(probe_counts) = crate::query_plan::indirect_paths_probe::deactivate() {
+            let pt = &self.parameters.statistics.phase_timings;
+            pt.indirect_probe_total.set(probe_counts.total as u128);
+            pt.indirect_probe_permissive_repeats
+                .set(probe_counts.permissive_repeats as u128);
+            pt.indirect_probe_strict_repeats
+                .set(probe_counts.strict_repeats as u128);
+        }
         let selection_start = std::time::Instant::now();
         self.compute_best_plan_from_closed_branches()?;
         self.parameters

@@ -260,6 +260,24 @@ pub struct PhaseTimings {
     pub dep_graph_process_ns: Cell<u128>,
     /// Total elapsed time from entry to exit of `build_query_plan`.
     pub total_ns: Cell<u128>,
+
+    // --- indirect_paths_probe what-if counters (instrumentation-only) ---
+    // These are populated by the `indirect_paths_probe` module during the
+    // open-branches loop. They measure the ceiling for a traversal-wide
+    // semantic cache around `compute_indirect_paths` — see that module for
+    // context. Not timing fields: repurposed `Cell<u128>` only for
+    // consistency with the other phase_timings counters.
+    /// Total `compute_indirect_paths` invocations during the last
+    /// traversal's open-branches loop.
+    pub indirect_probe_total: Cell<u128>,
+    /// Invocations whose *permissive* semantic fingerprint was already seen
+    /// earlier in the same traversal. Upper bound on the hit rate a
+    /// traversal-wide semantic cache could reach.
+    pub indirect_probe_permissive_repeats: Cell<u128>,
+    /// Invocations whose *strict* semantic fingerprint (prefix-aware, sound)
+    /// was already seen earlier in the same traversal. Lower bound on the
+    /// hit rate a correctness-preserving cache could reach.
+    pub indirect_probe_strict_repeats: Cell<u128>,
 }
 
 /// Deserialize helper for f64 that treats null as NaN.
