@@ -33,6 +33,7 @@ fn some_name() {
 
 mod cache_sharing;
 mod cancel;
+mod generate_large_schema;
 mod context;
 mod debug_max_evaluated_plans_configuration;
 mod defer;
