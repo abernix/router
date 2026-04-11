@@ -10,7 +10,7 @@ use crate::operation::SelectionSet;
 use crate::query_graph::QueryGraph;
 use crate::query_graph::condition_resolver::CachingConditionResolver;
 use crate::query_graph::condition_resolver::ConditionResolution;
-use crate::query_graph::condition_resolver::ConditionResolverCache;
+use crate::query_graph::condition_resolver::SharedConditionResolverCache;
 use crate::query_graph::graph_path::ExcludedConditions;
 use crate::query_graph::graph_path::ExcludedDestinations;
 use crate::query_graph::graph_path::operation::OpGraphPath;
@@ -68,7 +68,7 @@ struct ConditionValidationTraversal {
     /// The federated query graph for the supergraph schema.
     query_graph: Arc<QueryGraph>,
     /// The cache for condition resolution.
-    condition_resolver_cache: ConditionResolverCache,
+    condition_resolver_cache: SharedConditionResolverCache,
     /// The stack of open branches left to plan, along with state indicating the next selection to
     /// plan for them.
     // PORT_NOTE: This implementation closely follows the way `QueryPlanningTraversal` was ported.
@@ -83,7 +83,7 @@ impl ConditionValidationTraversal {
     ) -> Self {
         Self {
             query_graph,
-            condition_resolver_cache: ConditionResolverCache::new(),
+            condition_resolver_cache: SharedConditionResolverCache::new(),
             open_branches: vec![OpenBranchAndSelections {
                 selections: selections.into_iter().collect(),
                 open_branch: OpenBranch(vec![initial_option]),
@@ -174,8 +174,8 @@ impl CachingConditionResolver for ConditionValidationTraversal {
         &self.query_graph
     }
 
-    fn resolver_cache(&mut self) -> &mut ConditionResolverCache {
-        &mut self.condition_resolver_cache
+    fn resolver_cache(&self) -> &SharedConditionResolverCache {
+        &self.condition_resolver_cache
     }
 
     fn resolve_without_cache(

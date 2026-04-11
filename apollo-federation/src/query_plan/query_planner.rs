@@ -31,6 +31,7 @@ use crate::query_graph::OverrideConditions;
 use crate::query_graph::QueryGraph;
 use crate::query_graph::QueryGraphNodeType;
 use crate::query_graph::build_federated_query_graph;
+use crate::query_graph::condition_resolver::SharedConditionResolverCache;
 use crate::query_graph::path_tree::OpPathTree;
 use crate::query_plan::PlanNode;
 use crate::query_plan::QueryPlan;
@@ -262,6 +263,10 @@ pub struct QueryPlanner {
     // PORT_NOTE: Named `inconsistentAbstractTypesRuntimes` in the JS codebase, which was slightly
     // confusing.
     abstract_types_with_inconsistent_runtime_types: IndexSet<Name>,
+    /// Shared condition resolver cache that persists across query planning invocations for the
+    /// lifetime of this planner (one schema version). Condition resolutions computed during one
+    /// query's planning are reused by subsequent queries, avoiding redundant sub-traversals.
+    condition_resolver_cache: SharedConditionResolverCache,
 }
 
 impl QueryPlanner {
@@ -364,6 +369,7 @@ impl QueryPlanner {
             api_schema,
             interface_types_with_interface_objects,
             abstract_types_with_inconsistent_runtime_types,
+            condition_resolver_cache: SharedConditionResolverCache::new(),
         })
     }
 
@@ -491,6 +497,7 @@ impl QueryPlanner {
                     }
                 })
                 .collect(),
+            condition_resolver_cache: self.condition_resolver_cache.clone(),
         };
 
         let mut non_local_selection_state = options

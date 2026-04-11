@@ -20,7 +20,7 @@ use crate::query_graph::QueryGraph;
 use crate::query_graph::QueryGraphEdgeTransition;
 use crate::query_graph::condition_resolver::CachingConditionResolver;
 use crate::query_graph::condition_resolver::ConditionResolution;
-use crate::query_graph::condition_resolver::ConditionResolverCache;
+use crate::query_graph::condition_resolver::SharedConditionResolverCache;
 use crate::query_graph::graph_path::ExcludedConditions;
 use crate::query_graph::graph_path::ExcludedDestinations;
 use crate::query_graph::graph_path::operation::OpGraphPathContext;
@@ -52,7 +52,7 @@ struct TopLevelConditionResolver {
     /// The federated query graph for the supergraph schema.
     query_graph: Arc<QueryGraph>,
     /// The cache for top-level condition resolution.
-    condition_resolver_cache: ConditionResolverCache,
+    condition_resolver_cache: SharedConditionResolverCache,
 }
 
 /// When we visit a node in the API schema query graph, we keep track of any information about the
@@ -100,7 +100,7 @@ impl ValidationTraversal {
         let mut validation_traversal = Self {
             top_level_condition_resolver: TopLevelConditionResolver {
                 query_graph: federated_query_graph.clone(),
-                condition_resolver_cache: ConditionResolverCache::new(),
+                condition_resolver_cache: SharedConditionResolverCache::new(),
             },
             stack: vec![],
             previous_visits: Default::default(),
@@ -329,8 +329,8 @@ impl CachingConditionResolver for TopLevelConditionResolver {
         &self.query_graph
     }
 
-    fn resolver_cache(&mut self) -> &mut ConditionResolverCache {
-        &mut self.condition_resolver_cache
+    fn resolver_cache(&self) -> &SharedConditionResolverCache {
+        &self.condition_resolver_cache
     }
 
     fn resolve_without_cache(

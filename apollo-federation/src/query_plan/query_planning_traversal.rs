@@ -20,7 +20,7 @@ use crate::query_graph::QueryGraph;
 use crate::query_graph::QueryGraphNodeType;
 use crate::query_graph::condition_resolver::CachingConditionResolver;
 use crate::query_graph::condition_resolver::ConditionResolution;
-use crate::query_graph::condition_resolver::ConditionResolverCache;
+use crate::query_graph::condition_resolver::SharedConditionResolverCache;
 use crate::query_graph::graph_path::ExcludedConditions;
 use crate::query_graph::graph_path::ExcludedDestinations;
 use crate::query_graph::graph_path::operation::ClosedBranch;
@@ -90,6 +90,10 @@ pub(crate) struct QueryPlanningParameters<'a> {
     pub(crate) override_conditions: OverrideConditions,
     pub(crate) check_for_cooperative_cancellation: Option<&'a dyn Fn() -> ControlFlow<()>>,
     pub(crate) disabled_subgraphs: IndexSet<Arc<str>>,
+    /// Shared condition resolver cache that persists across traversals within a QueryPlanner's
+    /// lifetime. Condition resolutions computed during one query's planning are reused by
+    /// subsequent queries against the same schema.
+    pub(crate) condition_resolver_cache: SharedConditionResolverCache,
 }
 
 impl QueryPlanningParameters<'_> {
@@ -140,9 +144,10 @@ pub(crate) struct QueryPlanningTraversal<'a, 'b> {
     // TODO(@goto-bus-stop): FED-164: can we remove this? `find_best_plan` consumes `self` and returns the
     // best plan, so it should not be necessary to store it.
     best_plan: Option<BestQueryPlanInfo>,
-    /// The cache for condition resolution.
-    // PORT_NOTE: This is different from JS version. See `ConditionResolver` trait implementation below.
-    resolver_cache: ConditionResolverCache,
+    /// The cache for condition resolution, shared across all traversals within a QueryPlanner's
+    /// lifetime (i.e., for one schema version). This allows condition resolutions computed during
+    /// one query's planning to be reused by subsequent queries.
+    resolver_cache: SharedConditionResolverCache,
 }
 
 struct PlanInfo {
@@ -296,7 +301,7 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
             open_branches: Default::default(),
             closed_branches: Default::default(),
             best_plan: None,
-            resolver_cache: ConditionResolverCache::new(),
+            resolver_cache: parameters.condition_resolver_cache.clone(),
         };
 
         let initial_options = create_initial_options(
@@ -1159,6 +1164,7 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
             fetch_id_generator: self.parameters.fetch_id_generator.clone(),
             check_for_cooperative_cancellation: self.parameters.check_for_cooperative_cancellation,
             disabled_subgraphs: self.parameters.disabled_subgraphs.clone(),
+            condition_resolver_cache: self.parameters.condition_resolver_cache.clone(),
         };
         let best_plan_opt = QueryPlanningTraversal::new_inner(
             &parameters,
@@ -1242,8 +1248,8 @@ impl CachingConditionResolver for QueryPlanningTraversal<'_, '_> {
         &self.parameters.federated_query_graph
     }
 
-    fn resolver_cache(&mut self) -> &mut ConditionResolverCache {
-        &mut self.resolver_cache
+    fn resolver_cache(&self) -> &SharedConditionResolverCache {
+        &self.resolver_cache
     }
 
     fn resolve_without_cache(

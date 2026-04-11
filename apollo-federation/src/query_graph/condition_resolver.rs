@@ -4,6 +4,7 @@ use apollo_compiler::Name;
 use apollo_compiler::Node;
 use apollo_compiler::ast::Type;
 use apollo_compiler::collections::IndexMap;
+use parking_lot::Mutex;
 use petgraph::graph::EdgeIndex;
 
 use crate::error::FederationError;
@@ -129,7 +130,7 @@ impl ConditionResolverCache {
     }
 
     pub(crate) fn contains(
-        &mut self,
+        &self,
         edge: EdgeIndex,
         context: &OpGraphPathContext,
         excluded_destinations: &ExcludedDestinations,
@@ -177,6 +178,56 @@ impl ConditionResolverCache {
     }
 }
 
+/// A thread-safe, shared condition resolver cache that persists across query planning invocations
+/// for the lifetime of a `QueryPlanner` (i.e., for a single schema version).
+///
+/// The cache is keyed on `(EdgeIndex, ExcludedDestinations)`, which are stable for a fixed
+/// `QueryGraph`. On schema reload, the `QueryPlanner` is reconstructed, which naturally drops
+/// this cache and creates a fresh one.
+///
+/// Guard conditions from the underlying `ConditionResolverCache` still apply: entries are only
+/// cached when context is empty, excluded_conditions is empty, and extra_conditions is None.
+#[derive(Clone)]
+pub(crate) struct SharedConditionResolverCache {
+    inner: Arc<Mutex<ConditionResolverCache>>,
+}
+
+impl SharedConditionResolverCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ConditionResolverCache::new())),
+        }
+    }
+
+    pub(crate) fn contains(
+        &self,
+        edge: EdgeIndex,
+        context: &OpGraphPathContext,
+        excluded_destinations: &ExcludedDestinations,
+        excluded_conditions: &ExcludedConditions,
+        extra_conditions: Option<&SelectionSet>,
+    ) -> ConditionResolutionCacheResult {
+        self.inner.lock().contains(
+            edge,
+            context,
+            excluded_destinations,
+            excluded_conditions,
+            extra_conditions,
+        )
+    }
+
+    pub(crate) fn insert(
+        &self,
+        edge: EdgeIndex,
+        resolution: ConditionResolution,
+        excluded_destinations: ExcludedDestinations,
+    ) {
+        self.inner
+            .lock()
+            .insert(edge, resolution, excluded_destinations);
+    }
+}
+
 /// A query plan resolver for edge conditions that caches the outcome per edge.
 // PORT_NOTE: This ports the `cachingConditionResolver` function from JS. In JS version, the
 //            function creates a closure capturing the QueryPlanningTraversal/ValidationTraversal
@@ -196,7 +247,7 @@ pub(crate) trait CachingConditionResolver {
         extra_conditions: Option<&SelectionSet>,
     ) -> Result<ConditionResolution, FederationError>;
 
-    fn resolver_cache(&mut self) -> &mut ConditionResolverCache;
+    fn resolver_cache(&self) -> &SharedConditionResolverCache;
 
     fn resolve_with_cache(
         &mut self,
