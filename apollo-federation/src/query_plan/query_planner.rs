@@ -595,6 +595,11 @@ impl QueryPlanner {
     pub fn override_condition_labels(&self) -> &IndexSet<Arc<str>> {
         self.federated_query_graph.override_condition_labels()
     }
+
+    /// Returns the number of cached condition resolutions. Useful for observability and testing.
+    pub fn condition_resolver_cache_len(&self) -> usize {
+        self.condition_resolver_cache.len()
+    }
 }
 
 fn compute_root_serial_dependency_graph_for_mutation(

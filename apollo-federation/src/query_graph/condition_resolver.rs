@@ -226,6 +226,11 @@ impl SharedConditionResolverCache {
             .lock()
             .insert(edge, resolution, excluded_destinations);
     }
+
+    /// Returns the number of cached condition resolutions.
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().edge_states.len()
+    }
 }
 
 /// A query plan resolver for edge conditions that caches the outcome per edge.
@@ -372,5 +377,39 @@ mod tests {
                 )
                 .is_miss()
         );
+    }
+
+    #[test]
+    fn test_shared_cache_clones_share_state() {
+        let cache = SharedConditionResolverCache::new();
+        let cache2 = cache.clone();
+
+        let edge1 = EdgeIndex::new(1);
+        let empty_context = OpGraphPathContext::default();
+        let empty_destinations = ExcludedDestinations::default();
+        let empty_conditions = ExcludedConditions::default();
+
+        // Insert via first handle
+        cache.insert(
+            edge1,
+            ConditionResolution::unsatisfied_conditions(),
+            empty_destinations.clone(),
+        );
+
+        // Read via second handle — should see the entry
+        assert!(
+            cache2
+                .contains(
+                    edge1,
+                    &empty_context,
+                    &empty_destinations,
+                    &empty_conditions,
+                    None
+                )
+                .is_hit()
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache2.len(), 1);
     }
 }
