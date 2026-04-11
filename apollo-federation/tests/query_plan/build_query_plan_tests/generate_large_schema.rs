@@ -1576,7 +1576,7 @@ fn plan_and_measure(
 
     eprintln!("\n  === {label} ===");
     eprintln!(
-        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18}",
+        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20}",
         "query",
         "cold-µs",
         "warm-µs",
@@ -1590,6 +1590,7 @@ fn plan_and_measure(
         "fanOt",
         "warm new/loop/sel/prc",
         "sel sr/build/plans",
+        "build opt/dep/ot",
     );
 
     for (idx, query_str) in queries.iter().enumerate() {
@@ -1620,6 +1621,9 @@ fn plan_and_measure(
             sel_sort_reduce: u128,
             sel_initial_build: u128,
             sel_generate_plans: u128,
+            sel_op_path_tree: u128,
+            sel_updated_dep_graph: u128,
+            sel_other_trees: u128,
         }
         let mut timings: Vec<(std::time::Duration, usize, usize, PlanShape, Ns)> = Vec::new();
         let mut last_plan_str: Option<String> = None;
@@ -1643,6 +1647,9 @@ fn plan_and_measure(
                 sel_sort_reduce: pt.sel_sort_reduce_ns.get(),
                 sel_initial_build: pt.sel_initial_build_ns.get(),
                 sel_generate_plans: pt.sel_generate_plans_ns.get(),
+                sel_op_path_tree: pt.sel_op_path_tree_ns.get(),
+                sel_updated_dep_graph: pt.sel_updated_dep_graph_ns.get(),
+                sel_other_trees: pt.sel_other_trees_ns.get(),
             };
             timings.push((
                 elapsed,
@@ -1681,6 +1688,9 @@ fn plan_and_measure(
         let warm_sort_reduce_us = avg_us(|n| n.sel_sort_reduce);
         let warm_initial_build_us = avg_us(|n| n.sel_initial_build);
         let warm_generate_plans_us = avg_us(|n| n.sel_generate_plans);
+        let warm_op_path_tree_us = avg_us(|n| n.sel_op_path_tree);
+        let warm_updated_dep_graph_us = avg_us(|n| n.sel_updated_dep_graph);
+        let warm_other_trees_us = avg_us(|n| n.sel_other_trees);
         let speedup = cold.as_nanos() as f64 / warm_avg.as_nanos() as f64;
 
         let q_short = if query_str.len() > 40 {
@@ -1689,7 +1699,7 @@ fn plan_and_measure(
             query_str.to_string()
         };
         eprintln!(
-            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18}",
+            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20}",
             q_short,
             cold.as_micros(),
             warm_avg.as_micros(),
@@ -1708,6 +1718,10 @@ fn plan_and_measure(
             format!(
                 "{:>3}/{:>5}/{:>5}",
                 warm_sort_reduce_us, warm_initial_build_us, warm_generate_plans_us
+            ),
+            format!(
+                "{:>5}/{:>5}/{:>5}",
+                warm_op_path_tree_us, warm_updated_dep_graph_us, warm_other_trees_us
             ),
         );
 
@@ -1737,6 +1751,9 @@ fn plan_and_measure(
     );
     eprintln!(
         "            sr/build/plans   = sub-breakdown of sel: sort+reduce / initial-tree-and-FDG-build / generate_all_plans_and_find_best"
+    );
+    eprintln!(
+        "            opt/dep/ot       = sub-breakdown of build: OpPathTree::from_op_paths / updated_dependency_graph / other_trees materialization"
     );
 }
 

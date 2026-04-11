@@ -791,16 +791,28 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
                 .flat_map(|b| &b.0)
                 .flat_map(|cp| cp.flatten())
                 .collect();
+            let op_path_tree_start = std::time::Instant::now();
             initial_tree = OpPathTree::from_op_paths(
                 federated_query_graph.clone(),
                 *root,
                 &single_choice_branches,
             )?;
+            self.parameters
+                .statistics
+                .phase_timings
+                .sel_op_path_tree_ns
+                .set(op_path_tree_start.elapsed().as_nanos());
+            let updated_dep_graph_start = std::time::Instant::now();
             self.updated_dependency_graph(
                 &mut initial_dependency_graph,
                 &initial_tree,
                 self.parameters.config.type_conditioned_fetching,
             )?;
+            self.parameters
+                .statistics
+                .phase_timings
+                .sel_updated_dep_graph_ns
+                .set(updated_dep_graph_start.elapsed().as_nanos());
             snapshot!(
                 "FetchDependencyGraph",
                 initial_dependency_graph.to_dot(),
@@ -838,6 +850,7 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
         }
 
         // Build trees from the first group
+        let other_trees_start = std::time::Instant::now();
         let other_trees: Vec<Vec<Option<Arc<OpPathTree>>>> = first_group
             .iter()
             .map(|b| {
@@ -854,6 +867,11 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
                     .collect()
             })
             .collect();
+        self.parameters
+            .statistics
+            .phase_timings
+            .sel_other_trees_ns
+            .set(other_trees_start.elapsed().as_nanos());
         self.parameters
             .statistics
             .phase_timings

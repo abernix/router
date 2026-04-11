@@ -228,8 +228,25 @@ pub struct PhaseTimings {
     /// per-multi-choice-branch `other_trees`. This is FDG construction work
     /// that lives inside the "plan selection" phase rather than after it;
     /// it dominates when the query has many fetches and few multi-option
-    /// branches.
+    /// branches. Further subdivided by `sel_op_path_tree_ns`,
+    /// `sel_updated_dep_graph_ns`, and `sel_other_trees_ns` below.
     pub sel_initial_build_ns: Cell<u128>,
+    /// Sub-sub-sub-phase of `sel_initial_build_ns`: time in
+    /// `OpPathTree::from_op_paths` constructing the initial path-tree from
+    /// the single-choice branches. Only nonzero when at least one closed
+    /// branch has a unique option (i.e. the multi-choice group is not the
+    /// whole set).
+    pub sel_op_path_tree_ns: Cell<u128>,
+    /// Sub-sub-sub-phase of `sel_initial_build_ns`: time in
+    /// `updated_dependency_graph` building the initial `FetchDependencyGraph`
+    /// from the single-choice `OpPathTree`. This is the incremental-FDG
+    /// construction step inside plan selection.
+    pub sel_updated_dep_graph_ns: Cell<u128>,
+    /// Sub-sub-sub-phase of `sel_initial_build_ns`: time materializing the
+    /// per-multi-choice-branch `other_trees` vector-of-vectors for the
+    /// cartesian-product cost search. Zero on the single-plan early-return
+    /// path.
+    pub sel_other_trees_ns: Cell<u128>,
     /// Sub-sub-phase of `best_plan_selection_ns`: `generate_all_plans_and_find_best`
     /// — the cartesian-product branch-and-bound over multi-option closed
     /// branches, with cost-based pruning. Dominates when the query has
