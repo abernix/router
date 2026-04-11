@@ -360,6 +360,7 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
         )
     )]
     fn find_best_plan_inner(&mut self) -> Result<Option<&BestQueryPlanInfo>, FederationError> {
+        let open_loop_start = std::time::Instant::now();
         while !self.open_branches.is_empty() {
             self.parameters.check_cancellation()?;
             snapshot!(
@@ -394,7 +395,18 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
                 self.open_branches.push(new_branch);
             }
         }
+        self.parameters
+            .statistics
+            .phase_timings
+            .open_branches_loop_ns
+            .set(open_loop_start.elapsed().as_nanos());
+        let selection_start = std::time::Instant::now();
         self.compute_best_plan_from_closed_branches()?;
+        self.parameters
+            .statistics
+            .phase_timings
+            .best_plan_selection_ns
+            .set(selection_start.elapsed().as_nanos());
         Ok(self.best_plan.as_ref())
     }
 

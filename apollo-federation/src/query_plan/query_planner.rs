@@ -188,6 +188,13 @@ pub struct QueryPlanningStatistics {
 /// paths vs. building the FetchDependencyGraph vs. converting to PlanNodes).
 ///
 /// These are instrumentation-only and are excluded from plan (de)serialization.
+///
+/// Sub-phase timers (`traversal_new_ns`, `open_branches_loop_ns`,
+/// `best_plan_selection_ns`) capture the *last* traversal's contribution.
+/// For non-defer, non-mutation queries there is exactly one traversal, so
+/// they cleanly decompose `compute_dep_graph_ns`. Defer-conditional and
+/// mutation planning invoke multiple traversals; in those cases the sub-phase
+/// timers reflect only the final one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PhaseTimings {
     /// Time spent in `normalize_operation` (fragment inlining, selection
@@ -197,6 +204,20 @@ pub struct PhaseTimings {
     /// enumeration, FDG construction, cost-based plan selection. This is
     /// where the shared `ConditionResolverCache` is exercised.
     pub compute_dep_graph_ns: Cell<u128>,
+    /// Sub-phase of `compute_dep_graph_ns`: `QueryPlanningTraversal::new`
+    /// — initial option enumeration from the root node, non-local selection
+    /// metadata precompute.
+    pub traversal_new_ns: Cell<u128>,
+    /// Sub-phase of `compute_dep_graph_ns`: the open-branches while loop in
+    /// `find_best_plan_inner` — path enumeration via repeated
+    /// `handle_open_branch` calls. This is where condition resolution
+    /// amortizes via the shared `ConditionResolverCache`.
+    pub open_branches_loop_ns: Cell<u128>,
+    /// Sub-phase of `compute_dep_graph_ns`: `compute_best_plan_from_closed_branches`
+    /// — sort/reduce options, build the initial OpPathTree, iterate plan
+    /// combinations (cartesian product over multi-option branches) with
+    /// cost-based best-plan selection.
+    pub best_plan_selection_ns: Cell<u128>,
     /// Time spent in `FetchDependencyGraph::process`: `reduce_and_optimize`
     /// (fetch merging, transitive reduction) and conversion to the final
     /// `PlanNode` tree.
@@ -833,6 +854,7 @@ fn compute_root_parallel_best_plan(
     has_defers: bool,
     non_local_selection_state: &mut Option<non_local_selections_estimation::State>,
 ) -> Result<BestQueryPlanInfo, FederationError> {
+    let traversal_new_start = std::time::Instant::now();
     let planning_traversal = QueryPlanningTraversal::new(
         parameters,
         selection,
@@ -842,6 +864,11 @@ fn compute_root_parallel_best_plan(
         non_local_selection_state.as_mut(),
         None,
     )?;
+    parameters
+        .statistics
+        .phase_timings
+        .traversal_new_ns
+        .set(traversal_new_start.elapsed().as_nanos());
 
     // Getting no plan means the query is essentially unsatisfiable (it's a valid query, but we can prove it will never return a result),
     // so we just return an empty plan.

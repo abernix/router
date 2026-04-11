@@ -1576,7 +1576,7 @@ fn plan_and_measure(
 
     eprintln!("\n  === {label} ===");
     eprintln!(
-        "    {:<56} {:>9} {:>9} {:>7} {:>7} {:>6} {:>4} {:>4} {:>4} {:>5} {:>6} {:>20}",
+        "    {:<48} {:>8} {:>8} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>23}",
         "query",
         "cold-µs",
         "warm-µs",
@@ -1588,7 +1588,7 @@ fn plan_and_measure(
         "dep",
         "par/s",
         "fanOt",
-        "warm norm/cmp/proc µs",
+        "warm new/loop/sel/proc µs",
     );
 
     for (idx, query_str) in queries.iter().enumerate() {
@@ -1609,12 +1609,13 @@ fn plan_and_measure(
             }
         };
 
-        // Each iteration: (wall, paths, plans, shape, normalize_ns, compute_ns, process_ns)
+        // Each iteration: (wall, paths, plans, shape, new_ns, loop_ns, sel_ns, proc_ns)
         let mut timings: Vec<(
             std::time::Duration,
             usize,
             usize,
             PlanShape,
+            u128,
             u128,
             u128,
             u128,
@@ -1631,17 +1632,16 @@ fn plan_and_measure(
                 .expect("plan should succeed");
             let elapsed = start.elapsed();
             let shape = analyze_plan(&plan);
-            let norm_ns = plan.statistics.phase_timings.normalize_ns.get();
-            let comp_ns = plan.statistics.phase_timings.compute_dep_graph_ns.get();
-            let proc_ns = plan.statistics.phase_timings.dep_graph_process_ns.get();
+            let pt = &plan.statistics.phase_timings;
             timings.push((
                 elapsed,
                 plan.statistics.evaluated_plan_paths.get(),
                 plan.statistics.evaluated_plan_count.get(),
                 shape,
-                norm_ns,
-                comp_ns,
-                proc_ns,
+                pt.traversal_new_ns.get(),
+                pt.open_branches_loop_ns.get(),
+                pt.best_plan_selection_ns.get(),
+                pt.dep_graph_process_ns.get(),
             ));
             if Some(idx) == dump_plan_for && i == 0 {
                 last_plan_str = Some(format!("{plan}"));
@@ -1655,36 +1655,42 @@ fn plan_and_measure(
         let warm_count = (timings.len() - 1) as u32;
         let warm_avg: std::time::Duration = timings[1..]
             .iter()
-            .map(|(d, _, _, _, _, _, _)| *d)
+            .map(|(d, _, _, _, _, _, _, _)| *d)
             .sum::<std::time::Duration>()
             / warm_count;
-        let warm_norm_avg_us: u128 = timings[1..]
+        let warm_new_us: u128 = timings[1..]
             .iter()
-            .map(|(_, _, _, _, n, _, _)| *n)
+            .map(|(_, _, _, _, n, _, _, _)| *n)
             .sum::<u128>()
             / warm_count as u128
             / 1_000;
-        let warm_comp_avg_us: u128 = timings[1..]
+        let warm_loop_us: u128 = timings[1..]
             .iter()
-            .map(|(_, _, _, _, _, c, _)| *c)
+            .map(|(_, _, _, _, _, l, _, _)| *l)
             .sum::<u128>()
             / warm_count as u128
             / 1_000;
-        let warm_proc_avg_us: u128 = timings[1..]
+        let warm_sel_us: u128 = timings[1..]
             .iter()
-            .map(|(_, _, _, _, _, _, p)| *p)
+            .map(|(_, _, _, _, _, _, s, _)| *s)
+            .sum::<u128>()
+            / warm_count as u128
+            / 1_000;
+        let warm_proc_us: u128 = timings[1..]
+            .iter()
+            .map(|(_, _, _, _, _, _, _, p)| *p)
             .sum::<u128>()
             / warm_count as u128
             / 1_000;
         let speedup = cold.as_nanos() as f64 / warm_avg.as_nanos() as f64;
 
-        let q_short = if query_str.len() > 54 {
-            format!("{}...", &query_str[..51])
+        let q_short = if query_str.len() > 46 {
+            format!("{}...", &query_str[..43])
         } else {
             query_str.to_string()
         };
         eprintln!(
-            "    {:<56} {:>9} {:>9} {:>6.2}x {:>7} {:>6} {:>4} {:>4} {:>4} {:>5} {:>6} {:>20}",
+            "    {:<48} {:>8} {:>8} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>23}",
             q_short,
             cold.as_micros(),
             warm_avg.as_micros(),
@@ -1697,8 +1703,8 @@ fn plan_and_measure(
             format!("{}/{}", shape.parallel_groups, shape.sequence_groups),
             shape.max_parallel_fan_out,
             format!(
-                "{:>5}/{:>5}/{:>5}",
-                warm_norm_avg_us, warm_comp_avg_us, warm_proc_avg_us
+                "{:>4}/{:>5}/{:>4}/{:>4}",
+                warm_new_us, warm_loop_us, warm_sel_us, warm_proc_us
             ),
         );
 
@@ -1724,7 +1730,7 @@ fn plan_and_measure(
         "    legend: ftc=fetch nodes, sub=distinct subgraphs, dep=max depth, par/s=parallel/sequence groups, fanOt=max parallel children"
     );
     eprintln!(
-        "            norm/cmp/proc = warm-avg phase timings in µs (normalize / compute-dep-graph / process-dep-graph)"
+        "            new/loop/sel/proc = warm-avg phase timings in µs (traversal::new / open-branches loop / best-plan selection / dep-graph process)"
     );
 }
 
