@@ -177,6 +177,32 @@ pub struct QueryPlanningStatistics {
     /// `best_plan_cost` can be NaN, if the cost is not computed or irrelevant.
     #[serde(deserialize_with = "deserialize_f64_nullable")]
     pub best_plan_cost: f64,
+    /// Per-phase wall-clock timings in nanoseconds. Skipped in (de)serialization
+    /// because they are instrumentation, not part of the plan contract.
+    #[serde(default, skip)]
+    pub phase_timings: PhaseTimings,
+}
+
+/// Wall-clock nanosecond counters for each query-planning phase, used for
+/// identifying performance bottlenecks (e.g. how much time is spent enumerating
+/// paths vs. building the FetchDependencyGraph vs. converting to PlanNodes).
+///
+/// These are instrumentation-only and are excluded from plan (de)serialization.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PhaseTimings {
+    /// Time spent in `normalize_operation` (fragment inlining, selection
+    /// canonicalization, `@defer` extraction).
+    pub normalize_ns: Cell<u128>,
+    /// Time spent in `compute_root_parallel_dependency_graph`: path
+    /// enumeration, FDG construction, cost-based plan selection. This is
+    /// where the shared `ConditionResolverCache` is exercised.
+    pub compute_dep_graph_ns: Cell<u128>,
+    /// Time spent in `FetchDependencyGraph::process`: `reduce_and_optimize`
+    /// (fetch merging, transitive reduction) and conversion to the final
+    /// `PlanNode` tree.
+    pub dep_graph_process_ns: Cell<u128>,
+    /// Total elapsed time from entry to exit of `build_query_plan`.
+    pub total_ns: Cell<u128>,
 }
 
 /// Deserialize helper for f64 that treats null as NaN.
@@ -388,6 +414,8 @@ impl QueryPlanner {
         operation_name: Option<Name>,
         options: QueryPlanOptions,
     ) -> Result<QueryPlan, FederationError> {
+        let total_start = std::time::Instant::now();
+
         let operation = document
             .operations
             .get(operation_name.as_ref().map(|name| name.as_str()))
@@ -407,6 +435,7 @@ impl QueryPlanner {
 
         let statistics = QueryPlanningStatistics::default();
 
+        let normalize_start = std::time::Instant::now();
         let normalized_operation = normalize_operation(
             operation,
             &document.fragments,
@@ -425,6 +454,10 @@ impl QueryPlanner {
             defer_conditions,
             has_defers,
         } = normalized_operation.with_normalized_defer()?;
+        statistics
+            .phase_timings
+            .normalize_ns
+            .set(normalize_start.elapsed().as_nanos());
         if has_defers && is_subscription {
             return Err(SingleFederationError::DeferredSubscriptionUnsupported.into());
         }
@@ -562,6 +595,10 @@ impl QueryPlanner {
             None => None,
         };
 
+        statistics
+            .phase_timings
+            .total_ns
+            .set(total_start.elapsed().as_nanos());
         let plan = QueryPlan {
             node: root_node,
             statistics: QueryPlanningStatistics {
@@ -890,13 +927,25 @@ fn compute_plan_internal(
         // No cost computation necessary. Return NaN for cost.
         (main, deferred, primary_selection, f64::NAN)
     } else {
+        let compute_start = std::time::Instant::now();
         let (mut dependency_graph, cost) = compute_root_parallel_dependency_graph(
             parameters,
             has_defers,
             non_local_selection_state,
         )?;
+        parameters
+            .statistics
+            .phase_timings
+            .compute_dep_graph_ns
+            .set(compute_start.elapsed().as_nanos());
 
+        let process_start = std::time::Instant::now();
         let (main, deferred) = dependency_graph.process(&mut *processor, root_kind)?;
+        parameters
+            .statistics
+            .phase_timings
+            .dep_graph_process_ns
+            .set(process_start.elapsed().as_nanos());
         snapshot!(
             "FetchDependencyGraph",
             dependency_graph.to_dot(),
@@ -1447,6 +1496,7 @@ type User
             evaluated_plan_count: Cell::new(10),
             evaluated_plan_paths: Cell::new(20),
             best_plan_cost: f64::NAN,
+            phase_timings: PhaseTimings::default(),
         };
         let serialized = serde_json::to_string_pretty(&stats).expect("Serializing");
         insta::assert_snapshot!(serialized, @r###"
