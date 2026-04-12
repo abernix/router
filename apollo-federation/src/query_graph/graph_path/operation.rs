@@ -2063,6 +2063,8 @@ impl SimultaneousPathsWithLazyIndirectPaths {
                 debug!("Direct options");
                 let span = debug_span!(" |");
                 let gaurd = span.enter();
+                let da_start = crate::query_plan::loop_timers::is_active()
+                    .then(std::time::Instant::now);
                 let (advance_options, has_only_type_exploded_results) = path
                     .advance_with_operation_element(
                         supergraph_schema.clone(),
@@ -2073,6 +2075,11 @@ impl SimultaneousPathsWithLazyIndirectPaths {
                         check_cancellation,
                         disabled_subgraphs,
                     )?;
+                if let Some(start) = da_start {
+                    crate::query_plan::loop_timers::add_direct_advance(
+                        start.elapsed().as_nanos(),
+                    );
+                }
                 debug!("{advance_options:?}");
                 drop(gaurd);
                 // If we've got some options, there are a number of cases where there is no point
@@ -2118,14 +2125,21 @@ impl SimultaneousPathsWithLazyIndirectPaths {
             let mut options = options.unwrap_or_else(Vec::new);
             if let OpPathElement::Field(operation_field) = operation_element {
                 // Add whatever options can be obtained by taking some non-collecting edges first.
-                let paths_with_non_collecting_edges = self
-                    .indirect_options(
-                        path_index,
-                        condition_resolver,
-                        override_conditions,
-                        disabled_subgraphs,
-                    )?
-                    .filter_non_collecting_paths_for_field(operation_field)?;
+                let io_start = crate::query_plan::loop_timers::is_active()
+                    .then(std::time::Instant::now);
+                let indirect = self.indirect_options(
+                    path_index,
+                    condition_resolver,
+                    override_conditions,
+                    disabled_subgraphs,
+                )?;
+                if let Some(start) = io_start {
+                    crate::query_plan::loop_timers::add_indirect_options(
+                        start.elapsed().as_nanos(),
+                    );
+                }
+                let paths_with_non_collecting_edges =
+                    indirect.filter_non_collecting_paths_for_field(operation_field)?;
                 if !paths_with_non_collecting_edges.paths.is_empty() {
                     debug!(
                         "{} indirect paths",
@@ -2137,6 +2151,8 @@ impl SimultaneousPathsWithLazyIndirectPaths {
                         debug!("For indirect path {path_with_non_collecting_edges}:");
                         let span = debug_span!(" |");
                         let _gaurd = span.enter();
+                        let ia_start = crate::query_plan::loop_timers::is_active()
+                            .then(std::time::Instant::now);
                         let (advance_options, _) = path_with_non_collecting_edges
                             .advance_with_operation_element(
                                 supergraph_schema.clone(),
@@ -2147,6 +2163,11 @@ impl SimultaneousPathsWithLazyIndirectPaths {
                                 check_cancellation,
                                 disabled_subgraphs,
                             )?;
+                        if let Some(start) = ia_start {
+                            crate::query_plan::loop_timers::add_indirect_advance(
+                                start.elapsed().as_nanos(),
+                            );
+                        }
                         // If we can't advance the operation element after that path, ignore it,
                         // it's just not an option.
                         let Some(advance_options) = advance_options else {
@@ -2227,6 +2248,8 @@ impl SimultaneousPathsWithLazyIndirectPaths {
                     "Cannot defer (no indirect options); falling back to direct options"
                 );
                 let _guard = span.enter();
+                let fb_start = crate::query_plan::loop_timers::is_active()
+                    .then(std::time::Instant::now);
                 let (advance_options, _) = path.advance_with_operation_element(
                     supergraph_schema.clone(),
                     operation_element,
@@ -2236,6 +2259,11 @@ impl SimultaneousPathsWithLazyIndirectPaths {
                     check_cancellation,
                     disabled_subgraphs,
                 )?;
+                if let Some(start) = fb_start {
+                    crate::query_plan::loop_timers::add_direct_advance(
+                        start.elapsed().as_nanos(),
+                    );
+                }
                 options = advance_options.unwrap_or_else(Vec::new);
                 debug!("{options:?}");
             }
@@ -2251,8 +2279,13 @@ impl SimultaneousPathsWithLazyIndirectPaths {
             }
         }
 
+        let cp_start =
+            crate::query_plan::loop_timers::is_active().then(std::time::Instant::now);
         let all_options =
             SimultaneousPaths::flat_cartesian_product(options_for_each_path, check_cancellation)?;
+        if let Some(start) = cp_start {
+            crate::query_plan::loop_timers::add_cartesian_product(start.elapsed().as_nanos());
+        }
         debug!("{all_options:?}");
         Ok(Some(self.create_lazy_options(all_options, updated_context)))
     }

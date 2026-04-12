@@ -213,6 +213,30 @@ pub struct PhaseTimings {
     /// `handle_open_branch` calls. This is where condition resolution
     /// amortizes via the shared `ConditionResolverCache`.
     pub open_branches_loop_ns: Cell<u128>,
+    /// Sub-sub-phase of `open_branches_loop_ns`: total time inside the outer
+    /// `SimultaneousPathsWithLazyIndirectPaths::advance_with_operation_element`
+    /// calls made from `handle_open_branch`. Everything below
+    /// (`loop_direct_advance_ns`, `loop_indirect_options_ns`,
+    /// `loop_indirect_advance_ns`, `loop_cartesian_product_ns`) is a subset.
+    /// The gap between this and `open_branches_loop_ns` is per-branch
+    /// bookkeeping in `handle_open_branch` itself (record_closed_branch,
+    /// selection_set_is_fully_local_from_all_nodes, open_branches push/pop).
+    pub loop_outer_advance_ns: Cell<u128>,
+    /// Sub-sub-phase of `loop_outer_advance_ns`: total time in
+    /// `OpGraphPath::advance_with_operation_element` on the *direct* (non-
+    /// indirect) advance path.
+    pub loop_direct_advance_ns: Cell<u128>,
+    /// Sub-sub-phase of `loop_outer_advance_ns`: total time in
+    /// `SimultaneousPathsWithLazyIndirectPaths::indirect_options`, including
+    /// any underlying `compute_indirect_paths` Dijkstra work.
+    pub loop_indirect_options_ns: Cell<u128>,
+    /// Sub-sub-phase of `loop_outer_advance_ns`: total time in the
+    /// per-non-collecting-path `OpGraphPath::advance_with_operation_element`
+    /// calls made *after* `indirect_options` returns.
+    pub loop_indirect_advance_ns: Cell<u128>,
+    /// Sub-sub-phase of `loop_outer_advance_ns`: total time in
+    /// `SimultaneousPaths::flat_cartesian_product`.
+    pub loop_cartesian_product_ns: Cell<u128>,
     /// Sub-phase of `compute_dep_graph_ns`: `compute_best_plan_from_closed_branches`
     /// — sort/reduce options, build the initial OpPathTree, iterate plan
     /// combinations (cartesian product over multi-option branches) with

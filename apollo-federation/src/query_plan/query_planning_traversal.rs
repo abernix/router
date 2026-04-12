@@ -364,6 +364,12 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
         // for the duration of the open-branches loop. Deactivated below
         // after the loop exits so the counts reflect only this traversal.
         crate::query_plan::indirect_paths_probe::activate();
+        // Activate per-sub-phase wall-clock accumulators for the outer
+        // advance / direct advance / indirect options / indirect advance /
+        // cartesian product sub-calls inside `handle_open_branch`. Deactivated
+        // and drained below. These pay `Instant::now()` per sub-call only
+        // while the timers are active, so production planning is unaffected.
+        crate::query_plan::loop_timers::activate();
         let open_loop_start = std::time::Instant::now();
         while !self.open_branches.is_empty() {
             self.parameters.check_cancellation()?;
@@ -412,6 +418,15 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
             pt.indirect_probe_strict_repeats
                 .set(probe_counts.strict_repeats as u128);
         }
+        if let Some(loop_sub) = crate::query_plan::loop_timers::deactivate() {
+            let pt = &self.parameters.statistics.phase_timings;
+            pt.loop_outer_advance_ns.set(loop_sub.outer_advance_ns);
+            pt.loop_direct_advance_ns.set(loop_sub.direct_advance_ns);
+            pt.loop_indirect_options_ns.set(loop_sub.indirect_options_ns);
+            pt.loop_indirect_advance_ns.set(loop_sub.indirect_advance_ns);
+            pt.loop_cartesian_product_ns
+                .set(loop_sub.cartesian_product_ns);
+        }
         let selection_start = std::time::Instant::now();
         self.compute_best_plan_from_closed_branches()?;
         self.parameters
@@ -449,6 +464,8 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
 
         for option in options.iter_mut() {
             self.parameters.check_cancellation()?;
+            let outer_active = crate::query_plan::loop_timers::is_active();
+            let outer_start = outer_active.then(std::time::Instant::now);
             let followups_for_option = option.advance_with_operation_element(
                 self.parameters.supergraph_schema.clone(),
                 &operation_element,
@@ -457,6 +474,9 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
                 &|| self.parameters.check_cancellation(),
                 &self.parameters.disabled_subgraphs,
             )?;
+            if let Some(start) = outer_start {
+                crate::query_plan::loop_timers::add_outer_advance(start.elapsed().as_nanos());
+            }
             let Some(followups_for_option) = followups_for_option else {
                 // There is no valid way to advance the current operation element from this option
                 // so this option is a dead branch that cannot produce a valid query plan. So we

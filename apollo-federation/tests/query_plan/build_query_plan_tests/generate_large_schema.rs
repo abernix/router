@@ -1576,7 +1576,7 @@ fn plan_and_measure(
 
     eprintln!("\n  === {label} ===");
     eprintln!(
-        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20}",
+        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26}",
         "query",
         "cold-µs",
         "warm-µs",
@@ -1592,6 +1592,7 @@ fn plan_and_measure(
         "sel sr/build/plans",
         "build opt/dep/ot",
         "probe tot/perm/strict",
+        "loop out/dir/io/ia/cp",
     );
 
     for (idx, query_str) in queries.iter().enumerate() {
@@ -1628,6 +1629,11 @@ fn plan_and_measure(
             probe_total: u128,
             probe_permissive_repeats: u128,
             probe_strict_repeats: u128,
+            loop_outer_advance: u128,
+            loop_direct_advance: u128,
+            loop_indirect_options: u128,
+            loop_indirect_advance: u128,
+            loop_cartesian_product: u128,
         }
         let mut timings: Vec<(std::time::Duration, usize, usize, PlanShape, Ns)> = Vec::new();
         let mut last_plan_str: Option<String> = None;
@@ -1657,6 +1663,11 @@ fn plan_and_measure(
                 probe_total: pt.indirect_probe_total.get(),
                 probe_permissive_repeats: pt.indirect_probe_permissive_repeats.get(),
                 probe_strict_repeats: pt.indirect_probe_strict_repeats.get(),
+                loop_outer_advance: pt.loop_outer_advance_ns.get(),
+                loop_direct_advance: pt.loop_direct_advance_ns.get(),
+                loop_indirect_options: pt.loop_indirect_options_ns.get(),
+                loop_indirect_advance: pt.loop_indirect_advance_ns.get(),
+                loop_cartesian_product: pt.loop_cartesian_product_ns.get(),
             };
             timings.push((
                 elapsed,
@@ -1708,6 +1719,11 @@ fn plan_and_measure(
         let warm_probe_total = avg_count(|n| n.probe_total);
         let warm_probe_permissive = avg_count(|n| n.probe_permissive_repeats);
         let warm_probe_strict = avg_count(|n| n.probe_strict_repeats);
+        let warm_loop_outer_us = avg_us(|n| n.loop_outer_advance);
+        let warm_loop_direct_us = avg_us(|n| n.loop_direct_advance);
+        let warm_loop_io_us = avg_us(|n| n.loop_indirect_options);
+        let warm_loop_ia_us = avg_us(|n| n.loop_indirect_advance);
+        let warm_loop_cp_us = avg_us(|n| n.loop_cartesian_product);
         let speedup = cold.as_nanos() as f64 / warm_avg.as_nanos() as f64;
 
         let q_short = if query_str.len() > 40 {
@@ -1716,7 +1732,7 @@ fn plan_and_measure(
             query_str.to_string()
         };
         eprintln!(
-            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20}",
+            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26}",
             q_short,
             cold.as_micros(),
             warm_avg.as_micros(),
@@ -1743,6 +1759,14 @@ fn plan_and_measure(
             format!(
                 "{}/{}/{}",
                 warm_probe_total, warm_probe_permissive, warm_probe_strict
+            ),
+            format!(
+                "{}/{}/{}/{}/{}",
+                warm_loop_outer_us,
+                warm_loop_direct_us,
+                warm_loop_io_us,
+                warm_loop_ia_us,
+                warm_loop_cp_us,
             ),
         );
 
@@ -1775,6 +1799,9 @@ fn plan_and_measure(
     );
     eprintln!(
         "            opt/dep/ot       = sub-breakdown of build: OpPathTree::from_op_paths / updated_dependency_graph / other_trees materialization"
+    );
+    eprintln!(
+        "            out/dir/io/ia/cp = sub-breakdown of loop: outer advance / direct advance / indirect options / indirect advance / cartesian product"
     );
 }
 
