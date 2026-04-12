@@ -307,6 +307,25 @@ pub struct PhaseTimings {
     /// was already seen earlier in the same traversal. Lower bound on the
     /// hit rate a correctness-preserving cache could reach.
     pub indirect_probe_strict_repeats: Cell<u128>,
+
+    // --- FDG construction sub-timers ---
+    /// Total iterations of the main while-loop in `compute_nodes_for_tree`.
+    pub fdg_iterations: Cell<u128>,
+    /// Sum of ns spent in `add_at_path` calls inside `compute_nodes_for_tree`.
+    pub fdg_add_at_path_ns: Cell<u128>,
+    /// Sum of ns spent in `compute_nodes_for_key_resolution` (includes
+    /// recursive `compute_nodes_for_tree` for key conditions).
+    pub fdg_key_resolution_ns: Cell<u128>,
+    /// Number of `compute_nodes_for_key_resolution` calls.
+    pub fdg_key_resolution_calls: Cell<u128>,
+    /// Sum of ns spent in `compute_nodes_for_op_path_element`.
+    pub fdg_op_path_element_ns: Cell<u128>,
+    /// Number of `compute_nodes_for_op_path_element` calls.
+    pub fdg_op_path_element_calls: Cell<u128>,
+    /// Sum of ns spent in `compute_nodes_for_root_type_resolution`.
+    pub fdg_root_type_resolution_ns: Cell<u128>,
+    /// Number of `compute_nodes_for_root_type_resolution` calls.
+    pub fdg_root_type_resolution_calls: Cell<u128>,
 }
 
 /// Deserialize helper for f64 that treats null as NaN.

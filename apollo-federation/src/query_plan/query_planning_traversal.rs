@@ -839,11 +839,23 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
                 .sel_op_path_tree_ns
                 .set(op_path_tree_start.elapsed().as_nanos());
             let updated_dep_graph_start = std::time::Instant::now();
+            crate::query_plan::fdg_timers::activate();
             self.updated_dependency_graph(
                 &mut initial_dependency_graph,
                 &initial_tree,
                 self.parameters.config.type_conditioned_fetching,
             )?;
+            if let Some(fdg_subs) = crate::query_plan::fdg_timers::deactivate() {
+                let pt = &self.parameters.statistics.phase_timings;
+                pt.fdg_iterations.set(fdg_subs.iterations as u128);
+                pt.fdg_add_at_path_ns.set(fdg_subs.add_at_path_ns);
+                pt.fdg_key_resolution_ns.set(fdg_subs.key_resolution_ns);
+                pt.fdg_key_resolution_calls.set(fdg_subs.key_resolution_calls as u128);
+                pt.fdg_op_path_element_ns.set(fdg_subs.op_path_element_ns);
+                pt.fdg_op_path_element_calls.set(fdg_subs.op_path_element_calls as u128);
+                pt.fdg_root_type_resolution_ns.set(fdg_subs.root_type_resolution_ns);
+                pt.fdg_root_type_resolution_calls.set(fdg_subs.root_type_resolution_calls as u128);
+            }
             self.parameters
                 .statistics
                 .phase_timings

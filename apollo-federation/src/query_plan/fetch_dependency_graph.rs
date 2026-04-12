@@ -3479,8 +3479,13 @@ pub(crate) fn compute_nodes_for_tree(
     let mut created_nodes = IndexSet::default();
     while let Some(stack_item) = stack.pop() {
         check_cancellation()?;
+        if crate::query_plan::fdg_timers::is_active() {
+            crate::query_plan::fdg_timers::record_iteration();
+        }
         let node =
             FetchDependencyGraph::node_weight_mut(&mut dependency_graph.graph, stack_item.node_id)?;
+        let aap_start = crate::query_plan::fdg_timers::is_active()
+            .then(std::time::Instant::now);
         for selection_set in &stack_item.tree.local_selection_sets {
             node.selection_set_mut()
                 .add_at_path(&stack_item.node_path.path_in_node, Some(selection_set))?;
@@ -3494,7 +3499,13 @@ pub(crate) fn compute_nodes_for_tree(
             dependency_graph
                 .defer_tracking
                 .update_subselection(&stack_item.defer_context, None)?;
+            if let Some(start) = aap_start {
+                crate::query_plan::fdg_timers::add_at_path(start.elapsed().as_nanos());
+            }
             continue;
+        }
+        if let Some(start) = aap_start {
+            crate::query_plan::fdg_timers::add_at_path(start.elapsed().as_nanos());
         }
         // We want to preserve the order of the elements in the child,
         // but the stack will reverse everything,
@@ -3517,7 +3528,9 @@ pub(crate) fn compute_nodes_for_tree(
                     let edge = stack_item.tree.graph.edge_weight(edge_id)?;
                     match edge.transition {
                         QueryGraphEdgeTransition::KeyResolution => {
-                            stack.push(compute_nodes_for_key_resolution(
+                            let kr_start = crate::query_plan::fdg_timers::is_active()
+                                .then(std::time::Instant::now);
+                            let result = compute_nodes_for_key_resolution(
                                 dependency_graph,
                                 &stack_item,
                                 child,
@@ -3525,10 +3538,18 @@ pub(crate) fn compute_nodes_for_tree(
                                 new_context,
                                 &mut created_nodes,
                                 check_cancellation,
-                            )?);
+                            )?;
+                            if let Some(start) = kr_start {
+                                crate::query_plan::fdg_timers::add_key_resolution(
+                                    start.elapsed().as_nanos(),
+                                );
+                            }
+                            stack.push(result);
                         }
                         QueryGraphEdgeTransition::RootTypeResolution { root_kind } => {
-                            stack.push(compute_nodes_for_root_type_resolution(
+                            let rtr_start = crate::query_plan::fdg_timers::is_active()
+                                .then(std::time::Instant::now);
+                            let result = compute_nodes_for_root_type_resolution(
                                 dependency_graph,
                                 &stack_item,
                                 child,
@@ -3536,7 +3557,13 @@ pub(crate) fn compute_nodes_for_tree(
                                 edge,
                                 root_kind,
                                 new_context,
-                            )?);
+                            )?;
+                            if let Some(start) = rtr_start {
+                                crate::query_plan::fdg_timers::add_root_type_resolution(
+                                    start.elapsed().as_nanos(),
+                                );
+                            }
+                            stack.push(result);
                         }
                         _ => {
                             return Err(FederationError::internal(format!(
@@ -3546,14 +3573,22 @@ pub(crate) fn compute_nodes_for_tree(
                     }
                 }
                 OpGraphPathTrigger::OpPathElement(operation) => {
-                    stack.push(compute_nodes_for_op_path_element(
+                    let ope_start = crate::query_plan::fdg_timers::is_active()
+                        .then(std::time::Instant::now);
+                    let result = compute_nodes_for_op_path_element(
                         dependency_graph,
                         &stack_item,
                         child,
                         operation,
                         &mut created_nodes,
                         check_cancellation,
-                    )?);
+                    )?;
+                    if let Some(start) = ope_start {
+                        crate::query_plan::fdg_timers::add_op_path_element(
+                            start.elapsed().as_nanos(),
+                        );
+                    }
+                    stack.push(result);
                 }
             }
         }

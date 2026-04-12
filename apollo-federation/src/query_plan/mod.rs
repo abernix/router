@@ -10,6 +10,7 @@ use crate::query_plan::query_planner::QueryPlanningStatistics;
 
 pub(crate) mod conditions;
 pub(crate) mod display;
+pub(crate) mod fdg_timers;
 pub(crate) mod fetch_dependency_graph;
 pub(crate) mod fetch_dependency_graph_processor;
 pub mod generate;

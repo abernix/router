@@ -1576,7 +1576,7 @@ fn plan_and_measure(
 
     eprintln!("\n  === {label} ===");
     eprintln!(
-        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26} {:>12}",
+        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26} {:>12} {:>20}",
         "query",
         "cold-µs",
         "warm-µs",
@@ -1594,6 +1594,7 @@ fn plan_and_measure(
         "probe tot/perm/strict",
         "loop out/dir/io/ia/cp",
         "ia calls/none",
+        "fdg itr/aap/kr/ope",
     );
 
     for (idx, query_str) in queries.iter().enumerate() {
@@ -1637,6 +1638,14 @@ fn plan_and_measure(
             loop_cartesian_product: u128,
             loop_ia_calls: u128,
             loop_ia_none: u128,
+            fdg_iterations: u128,
+            fdg_add_at_path: u128,
+            fdg_key_resolution: u128,
+            fdg_key_resolution_calls: u128,
+            fdg_op_path_element: u128,
+            fdg_op_path_element_calls: u128,
+            fdg_root_type_resolution: u128,
+            fdg_root_type_resolution_calls: u128,
         }
         let mut timings: Vec<(std::time::Duration, usize, usize, PlanShape, Ns)> = Vec::new();
         let mut last_plan_str: Option<String> = None;
@@ -1673,6 +1682,14 @@ fn plan_and_measure(
                 loop_cartesian_product: pt.loop_cartesian_product_ns.get(),
                 loop_ia_calls: pt.loop_indirect_advance_calls.get(),
                 loop_ia_none: pt.loop_indirect_advance_none.get(),
+                fdg_iterations: pt.fdg_iterations.get(),
+                fdg_add_at_path: pt.fdg_add_at_path_ns.get(),
+                fdg_key_resolution: pt.fdg_key_resolution_ns.get(),
+                fdg_key_resolution_calls: pt.fdg_key_resolution_calls.get(),
+                fdg_op_path_element: pt.fdg_op_path_element_ns.get(),
+                fdg_op_path_element_calls: pt.fdg_op_path_element_calls.get(),
+                fdg_root_type_resolution: pt.fdg_root_type_resolution_ns.get(),
+                fdg_root_type_resolution_calls: pt.fdg_root_type_resolution_calls.get(),
             };
             timings.push((
                 elapsed,
@@ -1731,6 +1748,10 @@ fn plan_and_measure(
         let warm_loop_cp_us = avg_us(|n| n.loop_cartesian_product);
         let warm_ia_calls = avg_count(|n| n.loop_ia_calls);
         let warm_ia_none = avg_count(|n| n.loop_ia_none);
+        let warm_fdg_itr = avg_count(|n| n.fdg_iterations);
+        let warm_fdg_aap_us = avg_us(|n| n.fdg_add_at_path);
+        let warm_fdg_kr_us = avg_us(|n| n.fdg_key_resolution);
+        let warm_fdg_ope_us = avg_us(|n| n.fdg_op_path_element);
         let speedup = cold.as_nanos() as f64 / warm_avg.as_nanos() as f64;
 
         let q_short = if query_str.len() > 40 {
@@ -1739,7 +1760,7 @@ fn plan_and_measure(
             query_str.to_string()
         };
         eprintln!(
-            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26} {:>12}",
+            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26} {:>12} {:>20}",
             q_short,
             cold.as_micros(),
             warm_avg.as_micros(),
@@ -1776,6 +1797,10 @@ fn plan_and_measure(
                 warm_loop_cp_us,
             ),
             format!("{}/{}", warm_ia_calls, warm_ia_none),
+            format!(
+                "{}/{}/{}/{}",
+                warm_fdg_itr, warm_fdg_aap_us, warm_fdg_kr_us, warm_fdg_ope_us
+            ),
         );
 
         if let Some(plan_str) = last_plan_str {
@@ -1810,6 +1835,9 @@ fn plan_and_measure(
     );
     eprintln!(
         "            out/dir/io/ia/cp = sub-breakdown of loop: outer advance / direct advance / indirect options / indirect advance / cartesian product"
+    );
+    eprintln!(
+        "            itr/aap/kr/ope  = sub-breakdown of dep: iterations / add_at_path / key_resolution / op_path_element"
     );
 }
 
