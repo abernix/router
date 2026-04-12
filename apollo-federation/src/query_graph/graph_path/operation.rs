@@ -2148,6 +2148,32 @@ impl SimultaneousPathsWithLazyIndirectPaths {
                     for path_with_non_collecting_edges in
                         paths_with_non_collecting_edges.paths.iter()
                     {
+                        // Fast pre-filter: if the indirect path's tail node has no
+                        // field-collection edge for this field (O(1) HashMap lookup via
+                        // field_edge_index), skip the full advance. For object types this
+                        // is a sound skip; for interface types we still call advance
+                        // because type explosion may find the field through implementations.
+                        if path_with_non_collecting_edges
+                            .next_edge_for_field(operation_field, override_conditions)
+                            .is_none()
+                        {
+                            if let Ok(tail_weight) = path_with_non_collecting_edges
+                                .graph
+                                .node_weight(path_with_non_collecting_edges.tail)
+                            {
+                                if matches!(
+                                    &tail_weight.type_,
+                                    QueryGraphNodeType::SchemaType(
+                                        OutputTypeDefinitionPosition::Object(_)
+                                    )
+                                ) {
+                                    if crate::query_plan::loop_timers::is_active() {
+                                        crate::query_plan::loop_timers::record_indirect_advance_result(true);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         debug!("For indirect path {path_with_non_collecting_edges}:");
                         let span = debug_span!(" |");
                         let _gaurd = span.enter();
