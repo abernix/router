@@ -80,6 +80,10 @@ pub fn build_federated_query_graph(
         override_condition_labels: Default::default(),
         non_local_selection_metadata: Default::default(),
         field_edge_index: Default::default(),
+        semantic_edge_to_index: Default::default(),
+        semantic_index_to_edge: Default::default(),
+        semantic_node_to_index: Default::default(),
+        semantic_index_to_node: Default::default(),
     };
     let query_graph =
         extract_subgraphs_from_supergraph(&supergraph_schema, validate_extracted_subgraphs)?
@@ -161,6 +165,10 @@ pub(crate) fn build_query_graph(
         override_condition_labels: Default::default(),
         non_local_selection_metadata: Default::default(),
         field_edge_index: Default::default(),
+        semantic_edge_to_index: Default::default(),
+        semantic_index_to_edge: Default::default(),
+        semantic_node_to_index: Default::default(),
+        semantic_index_to_node: Default::default(),
     };
     let builder = SchemaQueryGraphBuilder::new(
         query_graph,
@@ -393,6 +401,50 @@ impl BaseQueryGraphBuilder {
         }
         self.query_graph.field_edge_index = index;
     }
+
+    fn precompute_semantic_indexes(&mut self) {
+        use crate::query_graph::SemanticEdgeId;
+        use crate::query_graph::SemanticNodeId;
+
+        // Build node indexes.
+        let mut node_to_index = std::collections::HashMap::new();
+        let mut index_to_node = std::collections::HashMap::new();
+        for node_idx in self.query_graph.graph.node_indices() {
+            let Some(node) = self.query_graph.graph.node_weight(node_idx) else {
+                continue;
+            };
+            let semantic_id = SemanticNodeId::from_node(node);
+            node_to_index.insert(semantic_id.clone(), node_idx);
+            index_to_node.insert(node_idx, semantic_id);
+        }
+
+        // Build edge indexes.
+        let mut edge_to_index = std::collections::HashMap::new();
+        let mut index_to_edge = std::collections::HashMap::new();
+        for edge_idx in self.query_graph.graph.edge_indices() {
+            let Some(edge_weight) = self.query_graph.graph.edge_weight(edge_idx) else {
+                continue;
+            };
+            let Some((head_idx, tail_idx)) = self.query_graph.graph.edge_endpoints(edge_idx)
+            else {
+                continue;
+            };
+            let Some(head_node) = self.query_graph.graph.node_weight(head_idx) else {
+                continue;
+            };
+            let Some(tail_node) = self.query_graph.graph.node_weight(tail_idx) else {
+                continue;
+            };
+            let semantic_id = SemanticEdgeId::from_edge(head_node, tail_node, edge_weight);
+            edge_to_index.insert(semantic_id.clone(), edge_idx);
+            index_to_edge.insert(edge_idx, semantic_id);
+        }
+
+        self.query_graph.semantic_node_to_index = node_to_index;
+        self.query_graph.semantic_index_to_node = index_to_node;
+        self.query_graph.semantic_edge_to_index = edge_to_index;
+        self.query_graph.semantic_index_to_edge = index_to_edge;
+    }
 }
 
 struct SchemaQueryGraphBuilder {
@@ -464,6 +516,7 @@ impl SchemaQueryGraphBuilder {
         }
         // Precompute the (node, field_name) → edge index for O(1) field-edge lookup.
         self.base.precompute_field_edge_index();
+        self.base.precompute_semantic_indexes();
         Ok(self.base.build())
     }
 
@@ -1212,6 +1265,7 @@ impl FederatedQueryGraphBuilder {
         self.base.precompute_non_trivial_followup_edges()?;
         // Precompute the (node, field_name) → edge index for O(1) field-edge lookup.
         self.base.precompute_field_edge_index();
+        self.base.precompute_semantic_indexes();
         // This method adds no nodes/edges, but just precomputes metadata for estimating the count
         // of non_local_selections.
         self.base.query_graph.non_local_selection_metadata =

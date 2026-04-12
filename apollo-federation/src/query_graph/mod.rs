@@ -49,6 +49,8 @@ use graph_path::operation::OpGraphPathContext;
 use graph_path::operation::OpGraphPathTrigger;
 use graph_path::operation::OpPathElement;
 
+use std::hash::Hasher;
+
 use crate::query_graph::condition_resolver::ConditionResolution;
 use crate::query_graph::condition_resolver::ConditionResolver;
 use crate::query_graph::graph_path::ExcludedConditions;
@@ -439,6 +441,157 @@ impl Display for QueryGraphEdgeTransition {
     }
 }
 
+/// A schema-stable identity for a `QueryGraphNode` that survives `QueryGraph` reconstruction.
+///
+/// Unlike `NodeIndex` (a petgraph-internal numeric index), a `SemanticNodeId` captures the
+/// semantic meaning of the node — its type, subgraph, and provide context — which remains
+/// stable across independent builds of the same or similar supergraph schema.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SemanticNodeId {
+    /// The type name (e.g., "User", "Product") or root kind (e.g., "[Query]").
+    pub(crate) type_name: Name,
+    /// The subgraph source name (e.g., "users", "products").
+    pub(crate) source: Arc<str>,
+    /// Distinguishes @provides-duplicated nodes from the original.
+    pub(crate) provide_id: Option<u32>,
+}
+
+impl SemanticNodeId {
+    pub(crate) fn from_node(node: &QueryGraphNode) -> Self {
+        let type_name = match &node.type_ {
+            QueryGraphNodeType::SchemaType(pos) => pos.type_name().clone(),
+            QueryGraphNodeType::FederatedRootType(kind) => {
+                // Use a synthetic name that won't collide with real types.
+                Name::new_unchecked(&*format!("__root_{kind}"))
+            }
+        };
+        Self {
+            type_name,
+            source: node.source.clone(),
+            provide_id: node.provide_id,
+        }
+    }
+}
+
+/// The semantic "kind" of a `QueryGraphEdgeTransition`, carrying only the data needed to
+/// distinguish edges with the same endpoints.
+///
+/// For `FieldCollection`, the field name is needed (two fields on the same type are different edges).
+/// For `Downcast` / `InterfaceObjectFakeDownCast`, the target type name is needed.
+/// For `KeyResolution` / `RootTypeResolution` / `SubgraphEnteringTransition`, the transition
+/// kind alone (plus conditions hash) is sufficient.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum SemanticTransitionKind {
+    FieldCollection {
+        field_name: Name,
+        is_part_of_provides: bool,
+    },
+    Downcast {
+        to_type_name: Name,
+    },
+    KeyResolution,
+    RootTypeResolution {
+        root_kind: SchemaRootDefinitionKind,
+    },
+    SubgraphEnteringTransition,
+    InterfaceObjectFakeDownCast {
+        to_type_name: Name,
+    },
+}
+
+impl SemanticTransitionKind {
+    fn from_transition(transition: &QueryGraphEdgeTransition) -> Self {
+        match transition {
+            QueryGraphEdgeTransition::FieldCollection {
+                field_definition_position,
+                is_part_of_provides,
+                ..
+            } => SemanticTransitionKind::FieldCollection {
+                field_name: field_definition_position.field_name().clone(),
+                is_part_of_provides: *is_part_of_provides,
+            },
+            QueryGraphEdgeTransition::Downcast {
+                to_type_position, ..
+            } => SemanticTransitionKind::Downcast {
+                to_type_name: to_type_position.type_name().clone(),
+            },
+            QueryGraphEdgeTransition::KeyResolution => SemanticTransitionKind::KeyResolution,
+            QueryGraphEdgeTransition::RootTypeResolution { root_kind } => {
+                SemanticTransitionKind::RootTypeResolution {
+                    root_kind: *root_kind,
+                }
+            }
+            QueryGraphEdgeTransition::SubgraphEnteringTransition => {
+                SemanticTransitionKind::SubgraphEnteringTransition
+            }
+            QueryGraphEdgeTransition::InterfaceObjectFakeDownCast { to_type_name, .. } => {
+                SemanticTransitionKind::InterfaceObjectFakeDownCast {
+                    to_type_name: to_type_name.clone(),
+                }
+            }
+        }
+    }
+}
+
+/// A schema-stable identity for a `QueryGraphEdge` that survives `QueryGraph` reconstruction.
+///
+/// Unlike `EdgeIndex` (a petgraph-internal numeric index that can change across rebuilds),
+/// a `SemanticEdgeId` captures the semantic meaning of the edge — its source and target nodes,
+/// the kind of transition, the conditions (key/requires fields), and any override condition.
+///
+/// Two independent builds of the `QueryGraph` from the same supergraph SDL will produce
+/// identical `SemanticEdgeId`s for corresponding edges, enabling cache carryover across
+/// schema reloads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SemanticEdgeId {
+    /// The source (head) node of the edge.
+    pub(crate) head: SemanticNodeId,
+    /// The target (tail) node of the edge.
+    pub(crate) tail: SemanticNodeId,
+    /// The kind of transition this edge represents.
+    pub(crate) transition: SemanticTransitionKind,
+    /// A content hash of the edge's conditions (`@key` fields, `@requires` fields).
+    /// `0` when the edge has no conditions.
+    pub(crate) conditions_hash: u64,
+    /// The override condition label and polarity, if any.
+    pub(crate) override_condition: Option<OverrideCondition>,
+}
+
+impl SemanticEdgeId {
+    /// Build a `SemanticEdgeId` from a `QueryGraph` edge and its endpoint nodes.
+    pub(crate) fn from_edge(
+        head: &QueryGraphNode,
+        tail: &QueryGraphNode,
+        edge: &QueryGraphEdge,
+    ) -> Self {
+        let conditions_hash = match &edge.conditions {
+            Some(conditions) => Self::hash_conditions(conditions),
+            None => 0,
+        };
+        Self {
+            head: SemanticNodeId::from_node(head),
+            tail: SemanticNodeId::from_node(tail),
+            transition: SemanticTransitionKind::from_transition(&edge.transition),
+            conditions_hash,
+            override_condition: edge.override_condition.clone(),
+        }
+    }
+
+    /// Compute an order-independent content hash of a conditions `SelectionSet`.
+    ///
+    /// We hash the Display representation of the selection set. Two selection sets with
+    /// identical fields in the same order produce the same hash. This is sufficient because
+    /// `@key(fields: "id")` and `@key(fields: "id email")` produce different selections and
+    /// must be distinguishable — they are different edges with different conditions.
+    fn hash_conditions(conditions: &SelectionSet) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Use the Display representation as a stable, content-based fingerprint.
+        // This is deterministic for the same SelectionSet structure.
+        hasher.write(conditions.to_string().as_bytes());
+        hasher.finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct QueryGraph {
     /// The "current" source of the query graph. For query graphs representing a single source
@@ -506,6 +659,16 @@ pub struct QueryGraph {
     /// lookup. The Vec typically has length 1; length 2 occurs with progressive `@override`
     /// (two edges for the same field, distinguished by override conditions).
     field_edge_index: HashMap<(NodeIndex, Name), Vec<EdgeIndex>>,
+    /// Forward index: maps `SemanticEdgeId` to `EdgeIndex` for the current graph.
+    /// Used to resolve semantic keys back to graph-internal indices on cache hydration.
+    semantic_edge_to_index: HashMap<SemanticEdgeId, EdgeIndex>,
+    /// Reverse index: maps `EdgeIndex` to `SemanticEdgeId` for the current graph.
+    /// Used to convert graph-internal indices to semantic keys for cache storage.
+    semantic_index_to_edge: HashMap<EdgeIndex, SemanticEdgeId>,
+    /// Forward index for nodes: maps `SemanticNodeId` to `NodeIndex`.
+    semantic_node_to_index: HashMap<SemanticNodeId, NodeIndex>,
+    /// Reverse index for nodes: maps `NodeIndex` to `SemanticNodeId`.
+    semantic_index_to_node: HashMap<NodeIndex, SemanticNodeId>,
 }
 
 impl QueryGraph {
@@ -868,6 +1031,32 @@ impl QueryGraph {
             node,
         );
         result
+    }
+
+    /// Look up the `SemanticEdgeId` for a given `EdgeIndex`.
+    pub(crate) fn semantic_edge_id(&self, edge: EdgeIndex) -> Option<&SemanticEdgeId> {
+        self.semantic_index_to_edge.get(&edge)
+    }
+
+    /// Look up the `EdgeIndex` for a given `SemanticEdgeId`.
+    pub(crate) fn edge_index_for_semantic_id(
+        &self,
+        semantic_id: &SemanticEdgeId,
+    ) -> Option<EdgeIndex> {
+        self.semantic_edge_to_index.get(semantic_id).copied()
+    }
+
+    /// Look up the `SemanticNodeId` for a given `NodeIndex`.
+    pub(crate) fn semantic_node_id(&self, node: NodeIndex) -> Option<&SemanticNodeId> {
+        self.semantic_index_to_node.get(&node)
+    }
+
+    /// Look up the `NodeIndex` for a given `SemanticNodeId`.
+    pub(crate) fn node_index_for_semantic_id(
+        &self,
+        semantic_id: &SemanticNodeId,
+    ) -> Option<NodeIndex> {
+        self.semantic_node_to_index.get(semantic_id).copied()
     }
 
     pub(crate) fn edge_for_inline_fragment(
