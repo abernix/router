@@ -2167,6 +2167,9 @@ impl SimultaneousPathsWithLazyIndirectPaths {
                             crate::query_plan::loop_timers::add_indirect_advance(
                                 start.elapsed().as_nanos(),
                             );
+                            crate::query_plan::loop_timers::record_indirect_advance_result(
+                                advance_options.is_none(),
+                            );
                         }
                         // If we can't advance the operation element after that path, ignore it,
                         // it's just not an option.

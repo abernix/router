@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
@@ -500,6 +501,11 @@ pub struct QueryGraph {
     /// To speed up the estimation of counting non-local selections, we precompute specific metadata
     /// about the query graph and store that here.
     non_local_selection_metadata: non_local_selections_estimation::QueryGraphMetadata,
+    /// Precomputed index mapping `(node, field_name)` to the field-collection edges for that
+    /// field. This replaces the O(out_edges) scan in `edge_for_field` with an O(1) HashMap
+    /// lookup. The Vec typically has length 1; length 2 occurs with progressive `@override`
+    /// (two edges for the same field, distinguished by override conditions).
+    field_edge_index: HashMap<(NodeIndex, Name), Vec<EdgeIndex>>,
 }
 
 impl QueryGraph {
@@ -847,40 +853,21 @@ impl QueryGraph {
         field: &Field,
         override_conditions: &OverrideConditions,
     ) -> Option<EdgeIndex> {
-        let mut candidates = self.out_edges(node).into_iter().filter_map(|edge_ref| {
-            let edge_weight = edge_ref.weight();
-            let QueryGraphEdgeTransition::FieldCollection {
-                field_definition_position,
-                ..
-            } = &edge_weight.transition
-            else {
-                return None;
-            };
-
-            if !edge_weight.satisfies_override_conditions(override_conditions) {
-                return None;
-            }
-
-            // We explicitly avoid comparing parent type's here, to allow interface object
-            // fields to match operation fields with the same name but differing types.
-            if field.field_position.field_name() == field_definition_position.field_name() {
-                Some(edge_ref.id())
-            } else {
-                None
-            }
+        let field_name = field.field_position.field_name();
+        let candidates = self.field_edge_index.get(&(node, field_name.clone()))?;
+        let mut iter = candidates.iter().copied().filter(|&edge_idx| {
+            self.graph
+                .edge_weight(edge_idx)
+                .map_or(false, |w| w.satisfies_override_conditions(override_conditions))
         });
-        if let Some(candidate) = candidates.next() {
-            // PORT_NOTE: The JS codebase used an assertion rather than a debug assertion here. We
-            // consider it unlikely for there to be more than one candidate given all the code paths
-            // that create edges, so we've downgraded this to a debug assertion.
-            debug_assert!(
-                candidates.next().is_none(),
-                "Unexpectedly found multiple candidates",
-            );
-            Some(candidate)
-        } else {
-            None
-        }
+        let result = iter.next();
+        debug_assert!(
+            result.is_none() || iter.next().is_none(),
+            "Unexpectedly found multiple candidates for field {} on node {:?}",
+            field_name,
+            node,
+        );
+        result
     }
 
     pub(crate) fn edge_for_inline_fragment(

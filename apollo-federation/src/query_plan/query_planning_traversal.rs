@@ -426,6 +426,10 @@ impl<'a: 'b, 'b> QueryPlanningTraversal<'a, 'b> {
             pt.loop_indirect_advance_ns.set(loop_sub.indirect_advance_ns);
             pt.loop_cartesian_product_ns
                 .set(loop_sub.cartesian_product_ns);
+            pt.loop_indirect_advance_calls
+                .set(loop_sub.indirect_advance_calls as u128);
+            pt.loop_indirect_advance_none
+                .set(loop_sub.indirect_advance_none as u128);
         }
         let selection_start = std::time::Instant::now();
         self.compute_best_plan_from_closed_branches()?;

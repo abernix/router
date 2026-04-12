@@ -1576,7 +1576,7 @@ fn plan_and_measure(
 
     eprintln!("\n  === {label} ===");
     eprintln!(
-        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26}",
+        "    {:<42} {:>7} {:>7} {:>6} {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26} {:>12}",
         "query",
         "cold-µs",
         "warm-µs",
@@ -1593,6 +1593,7 @@ fn plan_and_measure(
         "build opt/dep/ot",
         "probe tot/perm/strict",
         "loop out/dir/io/ia/cp",
+        "ia calls/none",
     );
 
     for (idx, query_str) in queries.iter().enumerate() {
@@ -1634,6 +1635,8 @@ fn plan_and_measure(
             loop_indirect_options: u128,
             loop_indirect_advance: u128,
             loop_cartesian_product: u128,
+            loop_ia_calls: u128,
+            loop_ia_none: u128,
         }
         let mut timings: Vec<(std::time::Duration, usize, usize, PlanShape, Ns)> = Vec::new();
         let mut last_plan_str: Option<String> = None;
@@ -1668,6 +1671,8 @@ fn plan_and_measure(
                 loop_indirect_options: pt.loop_indirect_options_ns.get(),
                 loop_indirect_advance: pt.loop_indirect_advance_ns.get(),
                 loop_cartesian_product: pt.loop_cartesian_product_ns.get(),
+                loop_ia_calls: pt.loop_indirect_advance_calls.get(),
+                loop_ia_none: pt.loop_indirect_advance_none.get(),
             };
             timings.push((
                 elapsed,
@@ -1724,6 +1729,8 @@ fn plan_and_measure(
         let warm_loop_io_us = avg_us(|n| n.loop_indirect_options);
         let warm_loop_ia_us = avg_us(|n| n.loop_indirect_advance);
         let warm_loop_cp_us = avg_us(|n| n.loop_cartesian_product);
+        let warm_ia_calls = avg_count(|n| n.loop_ia_calls);
+        let warm_ia_none = avg_count(|n| n.loop_ia_none);
         let speedup = cold.as_nanos() as f64 / warm_avg.as_nanos() as f64;
 
         let q_short = if query_str.len() > 40 {
@@ -1732,7 +1739,7 @@ fn plan_and_measure(
             query_str.to_string()
         };
         eprintln!(
-            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26}",
+            "    {:<42} {:>7} {:>7} {:>5.2}x {:>6} {:>5} {:>3} {:>3} {:>3} {:>5} {:>5} {:>20} {:>18} {:>20} {:>20} {:>26} {:>12}",
             q_short,
             cold.as_micros(),
             warm_avg.as_micros(),
@@ -1768,6 +1775,7 @@ fn plan_and_measure(
                 warm_loop_ia_us,
                 warm_loop_cp_us,
             ),
+            format!("{}/{}", warm_ia_calls, warm_ia_none),
         );
 
         if let Some(plan_str) = last_plan_str {

@@ -79,6 +79,7 @@ pub fn build_federated_query_graph(
         arguments_to_context_ids_by_source: Default::default(),
         override_condition_labels: Default::default(),
         non_local_selection_metadata: Default::default(),
+        field_edge_index: Default::default(),
     };
     let query_graph =
         extract_subgraphs_from_supergraph(&supergraph_schema, validate_extracted_subgraphs)?
@@ -159,6 +160,7 @@ pub(crate) fn build_query_graph(
         arguments_to_context_ids_by_source: Default::default(),
         override_condition_labels: Default::default(),
         non_local_selection_metadata: Default::default(),
+        field_edge_index: Default::default(),
     };
     let builder = SchemaQueryGraphBuilder::new(
         query_graph,
@@ -364,6 +366,33 @@ impl BaseQueryGraphBuilder {
         }
         Ok(())
     }
+
+    /// Precompute a mapping from `(NodeIndex, field_name)` to the field-collection edges for
+    /// that field. This turns the O(out_edges) scan in `edge_for_field` into an O(1) lookup.
+    fn precompute_field_edge_index(&mut self) {
+        let mut index = std::collections::HashMap::new();
+        for edge in self.query_graph.graph.edge_indices() {
+            let Some(edge_weight) = self.query_graph.graph.edge_weight(edge) else {
+                continue;
+            };
+            let QueryGraphEdgeTransition::FieldCollection {
+                field_definition_position,
+                ..
+            } = &edge_weight.transition
+            else {
+                continue;
+            };
+            let Some((head, _)) = self.query_graph.graph.edge_endpoints(edge) else {
+                continue;
+            };
+            let field_name = field_definition_position.field_name().clone();
+            index
+                .entry((head, field_name))
+                .or_insert_with(Vec::new)
+                .push(edge);
+        }
+        self.query_graph.field_edge_index = index;
+    }
 }
 
 struct SchemaQueryGraphBuilder {
@@ -433,6 +462,8 @@ impl SchemaQueryGraphBuilder {
         if self.subgraph.is_none() {
             self.base.precompute_non_trivial_followup_edges()?;
         }
+        // Precompute the (node, field_name) → edge index for O(1) field-edge lookup.
+        self.base.precompute_field_edge_index();
         Ok(self.base.build())
     }
 
@@ -1179,6 +1210,8 @@ impl FederatedQueryGraphBuilder {
         self.handle_interface_object()?;
         // This method adds no nodes/edges, but just precomputes followup edge information.
         self.base.precompute_non_trivial_followup_edges()?;
+        // Precompute the (node, field_name) → edge index for O(1) field-edge lookup.
+        self.base.precompute_field_edge_index();
         // This method adds no nodes/edges, but just precomputes metadata for estimating the count
         // of non_local_selections.
         self.base.query_graph.non_local_selection_metadata =

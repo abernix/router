@@ -237,6 +237,11 @@ pub struct PhaseTimings {
     /// Sub-sub-phase of `loop_outer_advance_ns`: total time in
     /// `SimultaneousPaths::flat_cartesian_product`.
     pub loop_cartesian_product_ns: Cell<u128>,
+    /// Total per-non-collecting-path `advance_with_operation_element` calls
+    /// in the indirect-advance loop.
+    pub loop_indirect_advance_calls: Cell<u128>,
+    /// How many of those returned `None` (field not found at tail node).
+    pub loop_indirect_advance_none: Cell<u128>,
     /// Sub-phase of `compute_dep_graph_ns`: `compute_best_plan_from_closed_branches`
     /// — sort/reduce options, build the initial OpPathTree, iterate plan
     /// combinations (cartesian product over multi-option branches) with

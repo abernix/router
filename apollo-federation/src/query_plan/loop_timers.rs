@@ -47,6 +47,11 @@ pub(crate) struct LoopSubtimings {
     pub(crate) indirect_advance_ns: u128,
     /// Sum of ns spent in `SimultaneousPaths::flat_cartesian_product`.
     pub(crate) cartesian_product_ns: u128,
+    /// Total per-non-collecting-path `advance_with_operation_element` calls
+    /// in the indirect-advance loop.
+    pub(crate) indirect_advance_calls: u64,
+    /// How many of those returned `None` (field not found at tail node).
+    pub(crate) indirect_advance_none: u64,
 }
 
 thread_local! {
@@ -114,6 +119,18 @@ pub(crate) fn add_cartesian_product(ns: u128) {
     TIMERS.with(|t| {
         if let Some(s) = t.borrow_mut().as_mut() {
             s.cartesian_product_ns += ns;
+        }
+    });
+}
+
+#[inline]
+pub(crate) fn record_indirect_advance_result(is_none: bool) {
+    TIMERS.with(|t| {
+        if let Some(s) = t.borrow_mut().as_mut() {
+            s.indirect_advance_calls += 1;
+            if is_none {
+                s.indirect_advance_none += 1;
+            }
         }
     });
 }
