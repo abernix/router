@@ -760,6 +760,26 @@ impl QueryPlanner {
     pub fn condition_resolver_cache_len(&self) -> usize {
         self.condition_resolver_cache.len()
     }
+
+    /// Returns a reference to the federated query graph. Useful for testing SemanticEdgeId stability.
+    #[cfg(test)]
+    pub(crate) fn query_graph(&self) -> &QueryGraph {
+        &self.federated_query_graph
+    }
+
+    /// Returns a clone of all cached condition resolution entries, for testing cache carryover.
+    #[cfg(test)]
+    pub(crate) fn condition_resolver_cache_entries(
+        &self,
+    ) -> IndexMap<
+        crate::query_graph::SemanticEdgeId,
+        (
+            crate::query_graph::condition_resolver::ConditionResolution,
+            crate::query_graph::graph_path::ExcludedDestinations,
+        ),
+    > {
+        self.condition_resolver_cache.entries()
+    }
 }
 
 fn compute_root_serial_dependency_graph_for_mutation(

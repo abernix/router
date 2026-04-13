@@ -3109,4 +3109,760 @@ type T
             ]
         );
     }
+
+    // ========================================================================
+    // SemanticEdgeId / SemanticNodeId tests
+    // ========================================================================
+
+    use crate::query_graph::SemanticEdgeId;
+    use crate::query_graph::SemanticNodeId;
+    use crate::query_graph::SemanticTransitionKind;
+
+    /// A multi-subgraph supergraph with @key, @override conditions, and multiple types.
+    /// Used as a fixture across many semantic ID tests.
+    const SEMANTIC_TEST_SUPERGRAPH: &str = r#"
+schema
+  @link(url: "https://specs.apollo.dev/link/v1.0")
+  @link(url: "https://specs.apollo.dev/join/v0.4", for: EXECUTION)
+{
+  query: Query
+}
+
+directive @join__directive(graphs: [join__Graph!], name: String!, args: join__DirectiveArguments) repeatable on SCHEMA | OBJECT | INTERFACE | FIELD_DEFINITION
+directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean, overrideLabel: String) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+scalar join__DirectiveArguments
+scalar join__FieldSet
+enum join__Graph {
+  SUBGRAPH_A @join__graph(name: "subgraphA", url: "http://localhost:4001")
+  SUBGRAPH_B @join__graph(name: "subgraphB", url: "http://localhost:4002")
+}
+scalar link__Import
+enum link__Purpose { SECURITY EXECUTION }
+
+type Query
+  @join__type(graph: SUBGRAPH_A)
+  @join__type(graph: SUBGRAPH_B)
+{
+  product: Product @join__field(graph: SUBGRAPH_A)
+}
+
+type Product
+  @join__type(graph: SUBGRAPH_A, key: "id")
+  @join__type(graph: SUBGRAPH_B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: SUBGRAPH_A, override: "subgraphB", overrideLabel: "percent(50)") @join__field(graph: SUBGRAPH_B, overrideLabel: "percent(50)")
+  price: Int @join__field(graph: SUBGRAPH_B)
+}
+    "#;
+
+    /// The common boilerplate for join/v0.4 supergraph SDL.
+    /// Prepend to schema body + graph enum + types.
+    const JOIN_V04_HEADER: &str = r#"
+schema
+  @link(url: "https://specs.apollo.dev/link/v1.0")
+  @link(url: "https://specs.apollo.dev/join/v0.4", for: EXECUTION)
+{
+  query: Query
+}
+
+directive @join__directive(graphs: [join__Graph!], name: String!, args: join__DirectiveArguments) repeatable on SCHEMA | OBJECT | INTERFACE | FIELD_DEFINITION
+directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean, overrideLabel: String) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+scalar join__DirectiveArguments
+scalar join__FieldSet
+scalar link__Import
+enum link__Purpose { SECURITY EXECUTION }
+    "#;
+
+    /// Helper: build a federated QueryGraph from a supergraph SDL body (without directives header).
+    /// Prepends JOIN_V04_HEADER automatically.
+    fn build_graph_from_body(body: &str) -> QueryGraph {
+        let sdl = format!("{JOIN_V04_HEADER}\n{body}");
+        let supergraph = crate::Supergraph::new_with_router_specs(&sdl).unwrap();
+        let api_schema = supergraph.to_api_schema(Default::default()).unwrap();
+        build_federated_query_graph(supergraph.schema.clone(), api_schema, None, None).unwrap()
+    }
+
+    /// Helper: build a federated QueryGraph from a full supergraph SDL string.
+    fn build_graph(supergraph_sdl: &str) -> QueryGraph {
+        let supergraph = crate::Supergraph::new_with_router_specs(supergraph_sdl).unwrap();
+        let api_schema = supergraph.to_api_schema(Default::default()).unwrap();
+        build_federated_query_graph(supergraph.schema.clone(), api_schema, None, None).unwrap()
+    }
+
+    /// Every node in the graph should have a SemanticNodeId, and the forward/reverse
+    /// indexes should be consistent.
+    #[test]
+    fn semantic_node_indexes_are_complete_and_bidirectional() {
+        let graph = build_graph(SEMANTIC_TEST_SUPERGRAPH);
+
+        for node_idx in graph.graph.node_indices() {
+            let semantic_id = graph
+                .semantic_node_id(node_idx)
+                .unwrap_or_else(|| panic!("node {node_idx:?} missing SemanticNodeId"));
+
+            let round_tripped = graph
+                .node_index_for_semantic_id(semantic_id)
+                .unwrap_or_else(|| {
+                    panic!("SemanticNodeId {semantic_id:?} not found in forward index")
+                });
+
+            assert_eq!(
+                node_idx, round_tripped,
+                "round-trip failed for node {node_idx:?}"
+            );
+        }
+    }
+
+    /// Every edge in the graph should have a SemanticEdgeId, and the forward/reverse
+    /// indexes should be consistent.
+    #[test]
+    fn semantic_edge_indexes_are_complete_and_bidirectional() {
+        let graph = build_graph(SEMANTIC_TEST_SUPERGRAPH);
+
+        for edge_idx in graph.graph.edge_indices() {
+            let semantic_id = graph
+                .semantic_edge_id(edge_idx)
+                .unwrap_or_else(|| panic!("edge {edge_idx:?} missing SemanticEdgeId"));
+
+            let round_tripped = graph
+                .edge_index_for_semantic_id(semantic_id)
+                .unwrap_or_else(|| {
+                    panic!("SemanticEdgeId {semantic_id:?} not found in forward index")
+                });
+
+            assert_eq!(
+                edge_idx, round_tripped,
+                "round-trip failed for edge {edge_idx:?}"
+            );
+        }
+    }
+
+    /// Building the same supergraph twice produces identical SemanticEdgeIds,
+    /// even though EdgeIndex values are petgraph-internal and could theoretically differ.
+    #[test]
+    fn semantic_edge_ids_are_stable_across_rebuilds() {
+        let graph1 = build_graph(SEMANTIC_TEST_SUPERGRAPH);
+        let graph2 = build_graph(SEMANTIC_TEST_SUPERGRAPH);
+
+        // Collect all SemanticEdgeIds from both graphs.
+        let ids1: std::collections::HashSet<_> = graph1
+            .graph
+            .edge_indices()
+            .filter_map(|e| graph1.semantic_edge_id(e).cloned())
+            .collect();
+        let ids2: std::collections::HashSet<_> = graph2
+            .graph
+            .edge_indices()
+            .filter_map(|e| graph2.semantic_edge_id(e).cloned())
+            .collect();
+
+        assert_eq!(
+            ids1, ids2,
+            "SemanticEdgeId sets should be identical across rebuilds"
+        );
+        assert!(
+            !ids1.is_empty(),
+            "Should have at least one edge with a SemanticEdgeId"
+        );
+    }
+
+    /// SemanticNodeIds are stable across independent builds of the same supergraph.
+    #[test]
+    fn semantic_node_ids_are_stable_across_rebuilds() {
+        let graph1 = build_graph(SEMANTIC_TEST_SUPERGRAPH);
+        let graph2 = build_graph(SEMANTIC_TEST_SUPERGRAPH);
+
+        let ids1: std::collections::HashSet<_> = graph1
+            .graph
+            .node_indices()
+            .filter_map(|n| graph1.semantic_node_id(n).cloned())
+            .collect();
+        let ids2: std::collections::HashSet<_> = graph2
+            .graph
+            .node_indices()
+            .filter_map(|n| graph2.semantic_node_id(n).cloned())
+            .collect();
+
+        assert_eq!(ids1, ids2);
+        assert!(!ids1.is_empty());
+    }
+
+    /// Each SemanticEdgeId in the graph is unique — no two distinct EdgeIndex values
+    /// share the same SemanticEdgeId.
+    #[test]
+    fn semantic_edge_ids_are_unique_per_edge() {
+        let graph = build_graph(SEMANTIC_TEST_SUPERGRAPH);
+
+        let mut seen: std::collections::HashMap<SemanticEdgeId, petgraph::graph::EdgeIndex> =
+            std::collections::HashMap::new();
+
+        for edge_idx in graph.graph.edge_indices() {
+            if let Some(semantic_id) = graph.semantic_edge_id(edge_idx) {
+                if let Some(prev_edge) = seen.get(semantic_id) {
+                    panic!(
+                        "Duplicate SemanticEdgeId {semantic_id:?} for edges {prev_edge:?} and {edge_idx:?}"
+                    );
+                }
+                seen.insert(semantic_id.clone(), edge_idx);
+            }
+        }
+    }
+
+    /// Override conditions are captured in SemanticEdgeId — two edges for the same field
+    /// with different override conditions produce different SemanticEdgeIds.
+    #[test]
+    fn override_conditions_distinguish_semantic_edge_ids() {
+        let graph = build_graph(SEMANTIC_TEST_SUPERGRAPH);
+
+        // Find edges with override conditions
+        let override_edges: Vec<_> = graph
+            .graph
+            .edge_indices()
+            .filter(|&e| graph.graph[e].override_condition.is_some())
+            .collect();
+
+        assert!(
+            override_edges.len() >= 2,
+            "Expected at least 2 override-conditioned edges, got {}",
+            override_edges.len()
+        );
+
+        // Each override edge should have a distinct SemanticEdgeId
+        let semantic_ids: std::collections::HashSet<_> = override_edges
+            .iter()
+            .filter_map(|&e| graph.semantic_edge_id(e))
+            .collect();
+        assert_eq!(
+            semantic_ids.len(),
+            override_edges.len(),
+            "Override-conditioned edges should have distinct SemanticEdgeIds"
+        );
+    }
+
+    /// Verify all transition kinds are properly captured in SemanticTransitionKind.
+    #[test]
+    fn semantic_edge_ids_cover_all_transition_kinds() {
+        let graph = build_graph_from_body(
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query
+  @join__type(graph: A)
+  @join__type(graph: B)
+{
+  user: User @join__field(graph: A)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  email: String! @join__field(graph: A) @join__field(graph: B, external: true)
+  profile: Profile @join__field(graph: B, requires: "email")
+}
+
+type Profile @join__type(graph: B) {
+  bio: String
+}
+            "#,
+        );
+
+        let mut found_field_collection = false;
+        let mut found_key_resolution = false;
+        let mut found_root_type_resolution = false;
+        let mut found_subgraph_entering = false;
+
+        for edge_idx in graph.graph.edge_indices() {
+            if let Some(semantic_id) = graph.semantic_edge_id(edge_idx) {
+                match &semantic_id.transition {
+                    SemanticTransitionKind::FieldCollection { .. } => {
+                        found_field_collection = true;
+                    }
+                    SemanticTransitionKind::KeyResolution => {
+                        found_key_resolution = true;
+                    }
+                    SemanticTransitionKind::RootTypeResolution { .. } => {
+                        found_root_type_resolution = true;
+                    }
+                    SemanticTransitionKind::SubgraphEnteringTransition => {
+                        found_subgraph_entering = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(found_field_collection, "Should have FieldCollection edges");
+        assert!(found_key_resolution, "Should have KeyResolution edges");
+        assert!(
+            found_root_type_resolution,
+            "Should have RootTypeResolution edges"
+        );
+        assert!(
+            found_subgraph_entering,
+            "Should have SubgraphEnteringTransition edges"
+        );
+    }
+
+    /// Different @key conditions produce different conditions_hash values.
+    #[test]
+    fn different_key_conditions_produce_different_hashes() {
+        let graph = build_graph_from_body(
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+  C @join__graph(name: "C", url: "http://localhost:4003")
+}
+
+type Query
+  @join__type(graph: A)
+  @join__type(graph: B)
+  @join__type(graph: C)
+{
+  product: Product @join__field(graph: A)
+}
+
+type Product
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+  @join__type(graph: C, key: "sku")
+{
+  id: ID!
+  sku: String! @join__field(graph: A) @join__field(graph: C)
+  name: String! @join__field(graph: B)
+  price: Int @join__field(graph: C)
+}
+            "#,
+        );
+
+        // Collect all key-resolution edges' conditions_hash values
+        let key_edges: Vec<_> = graph
+            .graph
+            .edge_indices()
+            .filter_map(|e| {
+                let semantic_id = graph.semantic_edge_id(e)?;
+                if matches!(
+                    semantic_id.transition,
+                    SemanticTransitionKind::KeyResolution
+                ) {
+                    Some(semantic_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            key_edges.len() >= 2,
+            "Expected at least 2 key resolution edges"
+        );
+
+        // Find edges with different conditions (id vs sku keys)
+        let hashes: std::collections::HashSet<_> =
+            key_edges.iter().map(|e| e.conditions_hash).collect();
+        assert!(
+            hashes.len() >= 2,
+            "Expected at least 2 distinct conditions_hash values for different @key fields, got {:?}",
+            hashes
+        );
+    }
+
+    /// Verify that the semantic indexes survive the full QueryPlanner construction path.
+    #[test]
+    fn semantic_indexes_populated_through_query_planner() {
+        let sdl = format!(
+            "{JOIN_V04_HEADER}\n{}",
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  user: User @join__field(graph: A)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  reviews: [Review] @join__field(graph: B)
+}
+
+type Review @join__type(graph: B) { body: String }
+            "#
+        );
+        let supergraph = crate::Supergraph::new_with_router_specs(&sdl).unwrap();
+        let planner = crate::query_plan::query_planner::QueryPlanner::new(
+            &supergraph,
+            Default::default(),
+        )
+        .unwrap();
+
+        let qg = planner.query_graph();
+
+        // Every edge should have a semantic ID
+        for edge_idx in qg.graph.edge_indices() {
+            assert!(
+                qg.semantic_edge_id(edge_idx).is_some(),
+                "edge {edge_idx:?} missing SemanticEdgeId after QueryPlanner construction"
+            );
+        }
+
+        // Every node should have a semantic ID
+        for node_idx in qg.graph.node_indices() {
+            assert!(
+                qg.semantic_node_id(node_idx).is_some(),
+                "node {node_idx:?} missing SemanticNodeId after QueryPlanner construction"
+            );
+        }
+    }
+
+    /// After planning a cross-subgraph query, cached condition resolution entries should
+    /// use SemanticEdgeId keys that are resolvable in an independently-built query graph.
+    #[test]
+    fn condition_cache_entries_use_semantic_keys() {
+        let sdl = format!(
+            "{JOIN_V04_HEADER}\n{}",
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  user: User @join__field(graph: A)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  reviews: [Review] @join__field(graph: B)
+}
+
+type Review @join__type(graph: B) { body: String }
+            "#
+        );
+        let supergraph = crate::Supergraph::new_with_router_specs(&sdl).unwrap();
+        let planner = crate::query_plan::query_planner::QueryPlanner::new(
+            &supergraph,
+            Default::default(),
+        )
+        .unwrap();
+
+        let api_schema = planner.api_schema();
+        let document = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api_schema.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+
+        // Plan — this should populate the condition cache
+        planner
+            .build_query_plan(&document, None, Default::default())
+            .unwrap();
+
+        assert!(
+            planner.condition_resolver_cache_len() > 0,
+            "Cache should have entries after planning a cross-subgraph query"
+        );
+
+        let entries = planner.condition_resolver_cache_entries();
+
+        // Build a second query graph from the same schema
+        let supergraph2 = crate::Supergraph::new_with_router_specs(&sdl).unwrap();
+        let api_schema2 = supergraph2.to_api_schema(Default::default()).unwrap();
+        let graph2 =
+            build_federated_query_graph(supergraph2.schema.clone(), api_schema2, None, None)
+                .unwrap();
+
+        // Every cached SemanticEdgeId should exist in the second graph
+        for (semantic_id, _) in &entries {
+            assert!(
+                graph2.edge_index_for_semantic_id(semantic_id).is_some(),
+                "Cached SemanticEdgeId {semantic_id:?} not found in rebuilt graph"
+            );
+        }
+    }
+
+    /// Downcast edges (for interface/union types) produce distinct SemanticEdgeIds
+    /// for each target type.
+    #[test]
+    fn downcast_edges_produce_distinct_semantic_ids() {
+        let graph = build_graph_from_body(
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+}
+
+interface Animal @join__type(graph: A) {
+  name: String!
+}
+
+type Dog implements Animal
+  @join__type(graph: A)
+  @join__implements(graph: A, interface: "Animal")
+{
+  name: String!
+  breed: String!
+}
+
+type Cat implements Animal
+  @join__type(graph: A)
+  @join__implements(graph: A, interface: "Animal")
+{
+  name: String!
+  color: String!
+}
+
+type Query @join__type(graph: A) {
+  animals: [Animal] @join__field(graph: A)
+}
+            "#,
+        );
+
+        // Find all downcast edges
+        let downcast_ids: Vec<_> = graph
+            .graph
+            .edge_indices()
+            .filter_map(|e| {
+                let sid = graph.semantic_edge_id(e)?;
+                if matches!(sid.transition, SemanticTransitionKind::Downcast { .. }) {
+                    Some(sid.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Should have downcasts for Dog and Cat from Animal
+        assert!(
+            downcast_ids.len() >= 2,
+            "Expected at least 2 downcast edges (Dog, Cat), got {}",
+            downcast_ids.len()
+        );
+
+        // Each downcast should have a distinct to_type_name
+        let type_names: std::collections::HashSet<_> = downcast_ids
+            .iter()
+            .filter_map(|sid| match &sid.transition {
+                SemanticTransitionKind::Downcast { to_type_name } => Some(to_type_name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            type_names.len() >= 2,
+            "Downcast edges should target distinct types"
+        );
+    }
+
+    /// Adding a new field to a schema should not change the SemanticEdgeIds of existing edges.
+    /// This is the key property enabling cache carryover across schema changes.
+    #[test]
+    fn adding_field_preserves_existing_semantic_edge_ids() {
+        let graph_v1 = build_graph_from_body(
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  user: User @join__field(graph: A)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  reviews: [Review] @join__field(graph: B)
+}
+
+type Review @join__type(graph: B) { body: String }
+            "#,
+        );
+
+        // V2: add a new field "email" to User in subgraph A
+        let graph_v2 = build_graph_from_body(
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  user: User @join__field(graph: A)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  email: String @join__field(graph: A)
+  reviews: [Review] @join__field(graph: B)
+}
+
+type Review @join__type(graph: B) { body: String }
+            "#,
+        );
+
+        let ids_v1: std::collections::HashSet<_> = graph_v1
+            .graph
+            .edge_indices()
+            .filter_map(|e| graph_v1.semantic_edge_id(e).cloned())
+            .collect();
+
+        let ids_v2: std::collections::HashSet<_> = graph_v2
+            .graph
+            .edge_indices()
+            .filter_map(|e| graph_v2.semantic_edge_id(e).cloned())
+            .collect();
+
+        // All V1 edges should be present in V2 (V2 is a superset)
+        for id in &ids_v1 {
+            assert!(
+                ids_v2.contains(id),
+                "V1 SemanticEdgeId {id:?} missing in V2 after adding a field"
+            );
+        }
+
+        // V2 should have strictly more edges (the new "email" field)
+        assert!(
+            ids_v2.len() > ids_v1.len(),
+            "V2 should have more edges than V1 (added email field)"
+        );
+    }
+
+    /// Changing a @key should invalidate only the affected edges' SemanticEdgeIds.
+    #[test]
+    fn changing_key_invalidates_only_affected_edges() {
+        let graph_v1 = build_graph_from_body(
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  product: Product @join__field(graph: A)
+}
+
+type Product
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  price: Int @join__field(graph: B)
+}
+            "#,
+        );
+
+        // V2: change key from "id" to "sku" in subgraph B
+        let graph_v2 = build_graph_from_body(
+            r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  product: Product @join__field(graph: A)
+}
+
+type Product
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "sku")
+{
+  id: ID!
+  sku: String! @join__field(graph: A) @join__field(graph: B)
+  name: String! @join__field(graph: A)
+  price: Int @join__field(graph: B)
+}
+            "#,
+        );
+
+        let ids_v1: std::collections::HashSet<_> = graph_v1
+            .graph
+            .edge_indices()
+            .filter_map(|e| graph_v1.semantic_edge_id(e).cloned())
+            .collect();
+
+        let ids_v2: std::collections::HashSet<_> = graph_v2
+            .graph
+            .edge_indices()
+            .filter_map(|e| graph_v2.semantic_edge_id(e).cloned())
+            .collect();
+
+        // FieldCollection edges for non-key fields should survive across versions
+        let field_edges_v1: std::collections::HashSet<_> = ids_v1
+            .iter()
+            .filter(|id| matches!(id.transition, SemanticTransitionKind::FieldCollection { .. }))
+            .collect();
+        let field_edges_v2: std::collections::HashSet<_> = ids_v2
+            .iter()
+            .filter(|id| matches!(id.transition, SemanticTransitionKind::FieldCollection { .. }))
+            .collect();
+
+        // "name" field edge from subgraph A should be in both versions
+        let name_edge_v1 = field_edges_v1.iter().find(|id| {
+            matches!(&id.transition, SemanticTransitionKind::FieldCollection { field_name, .. } if field_name.as_str() == "name")
+                && id.head.source.as_ref() == "A"
+        });
+        assert!(
+            name_edge_v1.is_some(),
+            "Should find 'name' field edge in V1"
+        );
+        assert!(
+            field_edges_v2.contains(name_edge_v1.unwrap()),
+            "'name' field edge should survive key change in V2"
+        );
+
+        // Key resolution edges should differ (different conditions_hash for changed key)
+        let key_edges_v1: std::collections::HashSet<_> = ids_v1
+            .iter()
+            .filter(|id| matches!(id.transition, SemanticTransitionKind::KeyResolution))
+            .collect();
+        let key_edges_v2: std::collections::HashSet<_> = ids_v2
+            .iter()
+            .filter(|id| matches!(id.transition, SemanticTransitionKind::KeyResolution))
+            .collect();
+
+        // Not all key edges should be the same (we changed B's key)
+        assert_ne!(
+            key_edges_v1, key_edges_v2,
+            "Key edges should differ after changing a @key"
+        );
+    }
 }
