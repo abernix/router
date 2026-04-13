@@ -10,6 +10,7 @@ use petgraph::graph::EdgeIndex;
 use crate::error::FederationError;
 use crate::operation::SelectionSet;
 use crate::query_graph::QueryGraph;
+use crate::query_graph::SemanticEdgeId;
 use crate::query_graph::graph_path::ExcludedConditions;
 use crate::query_graph::graph_path::ExcludedDestinations;
 use crate::query_graph::graph_path::operation::OpGraphPathContext;
@@ -119,7 +120,10 @@ pub(crate) struct ConditionResolverCache {
     // when we have no excluded edges, we'd only ever use the cache for the first key of every type. However,
     // as the algorithm always try keys in the same order (the order of the edges in the query graph), including
     // the excluded edges we see on the first ever call is actually the proper thing to do.
-    edge_states: IndexMap<EdgeIndex, (ConditionResolution, ExcludedDestinations)>,
+    //
+    // Keyed on `SemanticEdgeId` (schema-stable) rather than `EdgeIndex` (petgraph-internal) so
+    // that cached entries can survive `QueryGraph` reconstruction across schema reloads.
+    edge_states: IndexMap<SemanticEdgeId, (ConditionResolution, ExcludedDestinations)>,
 }
 
 impl ConditionResolverCache {
@@ -129,9 +133,13 @@ impl ConditionResolverCache {
         }
     }
 
+    /// Check if a cached resolution exists for the given semantic edge id.
+    ///
+    /// Guard conditions: returns `NotApplicable` if `extra_conditions` is set, `context` is
+    /// non-empty, or `excluded_conditions` is non-empty. These cases are not safe to cache.
     pub(crate) fn contains(
         &self,
-        edge: EdgeIndex,
+        semantic_id: &SemanticEdgeId,
         context: &OpGraphPathContext,
         excluded_destinations: &ExcludedDestinations,
         excluded_conditions: &ExcludedConditions,
@@ -152,7 +160,8 @@ impl ConditionResolverCache {
             return ConditionResolutionCacheResult::NotApplicable;
         }
 
-        if let Some((cached_resolution, cached_excluded_destinations)) = self.edge_states.get(&edge)
+        if let Some((cached_resolution, cached_excluded_destinations)) =
+            self.edge_states.get(semantic_id)
         {
             // Cache hit.
             // Ensure we have the same excluded destinations as when we cached the value.
@@ -169,21 +178,22 @@ impl ConditionResolverCache {
 
     pub(crate) fn insert(
         &mut self,
-        edge: EdgeIndex,
+        semantic_id: SemanticEdgeId,
         resolution: ConditionResolution,
         excluded_destinations: ExcludedDestinations,
     ) {
         self.edge_states
-            .insert(edge, (resolution, excluded_destinations));
+            .insert(semantic_id, (resolution, excluded_destinations));
     }
 }
 
 /// A thread-safe, shared condition resolver cache that persists across query planning invocations
 /// for the lifetime of a `QueryPlanner` (i.e., for a single schema version).
 ///
-/// The cache is keyed on `(EdgeIndex, ExcludedDestinations)`, which are stable for a fixed
-/// `QueryGraph`. On schema reload, the `QueryPlanner` is reconstructed, which naturally drops
-/// this cache and creates a fresh one.
+/// The cache is keyed on `SemanticEdgeId` (schema-stable identity) rather than `EdgeIndex`
+/// (petgraph-internal numeric index), enabling cache carryover across schema reloads.
+/// `ExcludedDestinations` (which uses subgraph names, not NodeIndex) is stored alongside each
+/// entry as a secondary match criterion.
 ///
 /// Guard conditions from the underlying `ConditionResolverCache` still apply: entries are only
 /// cached when context is empty, excluded_conditions is empty, and extra_conditions is None.
@@ -201,14 +211,14 @@ impl SharedConditionResolverCache {
 
     pub(crate) fn contains(
         &self,
-        edge: EdgeIndex,
+        semantic_id: &SemanticEdgeId,
         context: &OpGraphPathContext,
         excluded_destinations: &ExcludedDestinations,
         excluded_conditions: &ExcludedConditions,
         extra_conditions: Option<&SelectionSet>,
     ) -> ConditionResolutionCacheResult {
         self.inner.lock().contains(
-            edge,
+            semantic_id,
             context,
             excluded_destinations,
             excluded_conditions,
@@ -218,18 +228,25 @@ impl SharedConditionResolverCache {
 
     pub(crate) fn insert(
         &self,
-        edge: EdgeIndex,
+        semantic_id: SemanticEdgeId,
         resolution: ConditionResolution,
         excluded_destinations: ExcludedDestinations,
     ) {
         self.inner
             .lock()
-            .insert(edge, resolution, excluded_destinations);
+            .insert(semantic_id, resolution, excluded_destinations);
     }
 
     /// Returns the number of cached condition resolutions.
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().edge_states.len()
+    }
+
+    /// Returns a clone of all cached entries, for cache carryover across schema reloads.
+    pub(crate) fn entries(
+        &self,
+    ) -> IndexMap<SemanticEdgeId, (ConditionResolution, ExcludedDestinations)> {
+        self.inner.lock().edge_states.clone()
     }
 }
 
@@ -262,13 +279,22 @@ pub(crate) trait CachingConditionResolver {
         excluded_conditions: &ExcludedConditions,
         extra_conditions: Option<&SelectionSet>,
     ) -> Result<ConditionResolution, FederationError> {
-        let cache_result = self.resolver_cache().contains(
-            edge,
-            context,
-            excluded_destinations,
-            excluded_conditions,
-            extra_conditions,
-        );
+        // Convert EdgeIndex to SemanticEdgeId for the cache lookup.
+        // If the edge has no semantic ID (shouldn't happen for condition edges),
+        // fall through to uncached resolution.
+        let semantic_id = self.query_graph().semantic_edge_id(edge).cloned();
+
+        let cache_result = if let Some(ref sid) = semantic_id {
+            self.resolver_cache().contains(
+                sid,
+                context,
+                excluded_destinations,
+                excluded_conditions,
+                extra_conditions,
+            )
+        } else {
+            ConditionResolutionCacheResult::NotApplicable
+        };
 
         if let ConditionResolutionCacheResult::Hit(cached_resolution) = cache_result {
             return Ok(cached_resolution);
@@ -283,8 +309,10 @@ pub(crate) trait CachingConditionResolver {
         )?;
         // See if this resolution is eligible to be inserted into the cache.
         if cache_result.is_miss() {
-            self.resolver_cache()
-                .insert(edge, resolution.clone(), excluded_destinations.clone());
+            if let Some(sid) = semantic_id {
+                self.resolver_cache()
+                    .insert(sid, resolution.clone(), excluded_destinations.clone());
+            }
         }
         Ok(resolution)
     }
@@ -322,14 +350,35 @@ impl<T: CachingConditionResolver> ConditionResolver for T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_graph::SemanticNodeId;
+    use crate::query_graph::SemanticTransitionKind;
     use crate::query_graph::graph_path::operation::OpGraphPathContext;
-    //use crate::link::graphql_definition::{OperationConditional, OperationConditionalKind, BooleanOrVariable};
+
+    /// Helper to create a test SemanticEdgeId.
+    fn test_semantic_edge(id: u32) -> SemanticEdgeId {
+        let name = apollo_compiler::Name::new_unchecked(&*format!("Type{id}"));
+        SemanticEdgeId {
+            head: SemanticNodeId {
+                type_name: name.clone(),
+                source: format!("subgraph_{id}").into(),
+                provide_id: None,
+            },
+            tail: SemanticNodeId {
+                type_name: name,
+                source: format!("subgraph_{}", id + 1).into(),
+                provide_id: None,
+            },
+            transition: SemanticTransitionKind::KeyResolution,
+            conditions_hash: id as u64,
+            override_condition: None,
+        }
+    }
 
     #[test]
     fn test_condition_resolver_cache() {
         let mut cache = ConditionResolverCache::new();
 
-        let edge1 = EdgeIndex::new(1);
+        let edge1 = test_semantic_edge(1);
         let empty_context = OpGraphPathContext::default();
         let empty_destinations = ExcludedDestinations::default();
         let empty_conditions = ExcludedConditions::default();
@@ -337,7 +386,7 @@ mod tests {
         assert!(
             cache
                 .contains(
-                    edge1,
+                    &edge1,
                     &empty_context,
                     &empty_destinations,
                     &empty_conditions,
@@ -347,7 +396,7 @@ mod tests {
         );
 
         cache.insert(
-            edge1,
+            edge1.clone(),
             ConditionResolution::unsatisfied_conditions(),
             empty_destinations.clone(),
         );
@@ -355,7 +404,7 @@ mod tests {
         assert!(
             cache
                 .contains(
-                    edge1,
+                    &edge1,
                     &empty_context,
                     &empty_destinations,
                     &empty_conditions,
@@ -364,12 +413,12 @@ mod tests {
                 .is_hit(),
         );
 
-        let edge2 = EdgeIndex::new(2);
+        let edge2 = test_semantic_edge(2);
 
         assert!(
             cache
                 .contains(
-                    edge2,
+                    &edge2,
                     &empty_context,
                     &empty_destinations,
                     &empty_conditions,
@@ -384,14 +433,14 @@ mod tests {
         let cache = SharedConditionResolverCache::new();
         let cache2 = cache.clone();
 
-        let edge1 = EdgeIndex::new(1);
+        let edge1 = test_semantic_edge(1);
         let empty_context = OpGraphPathContext::default();
         let empty_destinations = ExcludedDestinations::default();
         let empty_conditions = ExcludedConditions::default();
 
         // Insert via first handle
         cache.insert(
-            edge1,
+            edge1.clone(),
             ConditionResolution::unsatisfied_conditions(),
             empty_destinations.clone(),
         );
@@ -400,7 +449,7 @@ mod tests {
         assert!(
             cache2
                 .contains(
-                    edge1,
+                    &edge1,
                     &empty_context,
                     &empty_destinations,
                     &empty_conditions,
