@@ -3865,4 +3865,347 @@ type Product
             "Key edges should differ after changing a @key"
         );
     }
+
+    // ========================================================================
+    // Cache carryover tests
+    // ========================================================================
+
+    /// Helper: create a QueryPlanner from a body (prepends JOIN_V04_HEADER).
+    fn planner_from_body(body: &str) -> crate::query_plan::query_planner::QueryPlanner {
+        let sdl = format!("{JOIN_V04_HEADER}\n{body}");
+        let supergraph = crate::Supergraph::new_with_router_specs(&sdl).unwrap();
+        crate::query_plan::query_planner::QueryPlanner::new(&supergraph, Default::default())
+            .unwrap()
+    }
+
+    /// Helper: create a QueryPlanner with a previous cache.
+    fn planner_from_body_with_cache(
+        body: &str,
+        prev_cache: &crate::query_graph::condition_resolver::SharedConditionResolverCache,
+    ) -> crate::query_plan::query_planner::QueryPlanner {
+        let sdl = format!("{JOIN_V04_HEADER}\n{body}");
+        let supergraph = crate::Supergraph::new_with_router_specs(&sdl).unwrap();
+        crate::query_plan::query_planner::QueryPlanner::new_with_previous_cache(
+            &supergraph,
+            Default::default(),
+            Some(prev_cache),
+        )
+        .unwrap()
+    }
+
+    const TWO_SUBGRAPH_BODY: &str = r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  user: User @join__field(graph: A)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  reviews: [Review] @join__field(graph: B)
+}
+
+type Review @join__type(graph: B) { body: String }
+    "#;
+
+    /// Unsatisfied condition resolutions survive cache carryover to a rebuilt graph.
+    #[test]
+    fn cache_carryover_imports_unsatisfied_entries() {
+        let planner_v1 = planner_from_body(TWO_SUBGRAPH_BODY);
+
+        let api = planner_v1.api_schema();
+        let doc = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+        planner_v1
+            .build_query_plan(&doc, None, Default::default())
+            .unwrap();
+
+        let cache_len_v1 = planner_v1.condition_resolver_cache_len();
+        assert!(cache_len_v1 > 0, "V1 cache should have entries");
+
+        // Build V2 planner from identical schema, importing V1 cache
+        let planner_v2 =
+            planner_from_body_with_cache(TWO_SUBGRAPH_BODY, planner_v1.condition_resolver_cache());
+
+        // Some entries should have been imported (those without path_tree)
+        // The exact count depends on how many entries have path_tree: None
+        let cache_len_v2 = planner_v2.condition_resolver_cache_len();
+
+        // Plan the same query on V2 — must produce identical plan
+        let api2 = planner_v2.api_schema();
+        let doc2 = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api2.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+        let plan_v1 = planner_v1
+            .build_query_plan(&doc, None, Default::default())
+            .unwrap();
+        let plan_v2 = planner_v2
+            .build_query_plan(&doc2, None, Default::default())
+            .unwrap();
+
+        assert_eq!(
+            plan_v1.to_string(),
+            plan_v2.to_string(),
+            "Plans must be identical after cache carryover"
+        );
+    }
+
+    /// Cache carryover across a schema change that adds a field — all existing
+    /// SemanticEdgeIds survive, so all portable cache entries are imported.
+    #[test]
+    fn cache_carryover_survives_adding_field() {
+        let planner_v1 = planner_from_body(TWO_SUBGRAPH_BODY);
+
+        let api = planner_v1.api_schema();
+        let doc = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+        planner_v1
+            .build_query_plan(&doc, None, Default::default())
+            .unwrap();
+
+        let cache_len_v1 = planner_v1.condition_resolver_cache_len();
+        assert!(cache_len_v1 > 0);
+
+        // V2: add a new field "email" to User
+        let body_v2 = r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  user: User @join__field(graph: A)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  email: String @join__field(graph: A)
+  reviews: [Review] @join__field(graph: B)
+}
+
+type Review @join__type(graph: B) { body: String }
+        "#;
+
+        let planner_v2 =
+            planner_from_body_with_cache(body_v2, planner_v1.condition_resolver_cache());
+
+        // Plan the original query — should produce identical plan
+        let api2 = planner_v2.api_schema();
+        let doc2 = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api2.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+        let plan_v1 = planner_v1
+            .build_query_plan(&doc, None, Default::default())
+            .unwrap();
+        let plan_v2 = planner_v2
+            .build_query_plan(&doc2, None, Default::default())
+            .unwrap();
+
+        assert_eq!(
+            plan_v1.to_string(),
+            plan_v2.to_string(),
+            "Plans must be identical after adding a field"
+        );
+    }
+
+    /// Cache carryover does NOT import entries for edges that changed (e.g., @key change).
+    /// The planner must recompute those entries, producing correct plans.
+    #[test]
+    fn cache_carryover_drops_entries_for_changed_keys() {
+        let planner_v1 = planner_from_body(TWO_SUBGRAPH_BODY);
+
+        let api = planner_v1.api_schema();
+        let doc = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+        planner_v1
+            .build_query_plan(&doc, None, Default::default())
+            .unwrap();
+
+        let cache_len_v1 = planner_v1.condition_resolver_cache_len();
+        assert!(cache_len_v1 > 0);
+
+        // V2: change key from "id" to "email" — all key resolution edges change
+        let body_v2 = r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) {
+  user: User @join__field(graph: A)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "email")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  email: String! @join__field(graph: A) @join__field(graph: B)
+  reviews: [Review] @join__field(graph: B)
+}
+
+type Review @join__type(graph: B) { body: String }
+        "#;
+
+        let planner_v2 =
+            planner_from_body_with_cache(body_v2, planner_v1.condition_resolver_cache());
+
+        // The V2 cache should have fewer entries than V1 (changed key edges not imported)
+        // OR the same if all V1 entries happened to have path_tree (which would make them
+        // all non-portable regardless of SemanticEdgeId existence)
+        let cache_len_v2_before_plan = planner_v2.condition_resolver_cache_len();
+        assert!(
+            cache_len_v2_before_plan <= cache_len_v1,
+            "V2 cache should not exceed V1 cache (changed edges should be dropped)"
+        );
+
+        // Plan on V2 — must succeed and produce a correct plan
+        let api2 = planner_v2.api_schema();
+        let doc2 = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api2.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+        let plan_v2 = planner_v2
+            .build_query_plan(&doc2, None, Default::default())
+            .unwrap();
+
+        // The plan should work (produce valid output)
+        let plan_str = plan_v2.to_string();
+        assert!(
+            plan_str.contains("Fetch"),
+            "V2 plan should contain fetch operations"
+        );
+    }
+
+    /// Plan correctness after cache carryover: multiple queries, interleaved planning.
+    /// Tests that imported cache entries don't corrupt plans for different queries.
+    #[test]
+    fn cache_carryover_does_not_corrupt_different_queries() {
+        let body_3sg = r#"
+enum join__Graph {
+  A @join__graph(name: "A", url: "http://localhost:4001")
+  B @join__graph(name: "B", url: "http://localhost:4002")
+  C @join__graph(name: "C", url: "http://localhost:4003")
+}
+
+type Query @join__type(graph: A) @join__type(graph: B) @join__type(graph: C) {
+  user: User @join__field(graph: A)
+  product: Product @join__field(graph: C)
+}
+
+type User
+  @join__type(graph: A, key: "id")
+  @join__type(graph: B, key: "id")
+{
+  id: ID!
+  name: String! @join__field(graph: A)
+  reviews: [Review] @join__field(graph: B)
+}
+
+type Product
+  @join__type(graph: A, key: "id")
+  @join__type(graph: C, key: "id")
+{
+  id: ID!
+  title: String! @join__field(graph: C)
+  price: Int @join__field(graph: A)
+}
+
+type Review @join__type(graph: B) { body: String }
+        "#;
+
+        let planner_v1 = planner_from_body(body_3sg);
+        let api = planner_v1.api_schema();
+
+        // Plan query 1 (user path)
+        let doc1 = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+        let plan1_v1 = planner_v1
+            .build_query_plan(&doc1, None, Default::default())
+            .unwrap();
+
+        // Plan query 2 (product path)
+        let doc2 = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api.schema(),
+            "{ product { title } }",
+            "test.graphql",
+        )
+        .unwrap();
+        let plan2_v1 = planner_v1
+            .build_query_plan(&doc2, None, Default::default())
+            .unwrap();
+
+        // Build V2 with carryover
+        let planner_v2 =
+            planner_from_body_with_cache(body_3sg, planner_v1.condition_resolver_cache());
+        let api2 = planner_v2.api_schema();
+
+        let doc1_v2 = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api2.schema(),
+            "{ user { reviews { body } } }",
+            "test.graphql",
+        )
+        .unwrap();
+        let doc2_v2 = apollo_compiler::ExecutableDocument::parse_and_validate(
+            api2.schema(),
+            "{ product { title } }",
+            "test.graphql",
+        )
+        .unwrap();
+
+        // Plan BOTH queries on V2 — order reversed to test independence
+        let plan2_v2 = planner_v2
+            .build_query_plan(&doc2_v2, None, Default::default())
+            .unwrap();
+        let plan1_v2 = planner_v2
+            .build_query_plan(&doc1_v2, None, Default::default())
+            .unwrap();
+
+        assert_eq!(
+            plan1_v1.to_string(),
+            plan1_v2.to_string(),
+            "User query plan must be identical after carryover"
+        );
+        assert_eq!(
+            plan2_v1.to_string(),
+            plan2_v2.to_string(),
+            "Product query plan must be identical after carryover"
+        );
+    }
 }

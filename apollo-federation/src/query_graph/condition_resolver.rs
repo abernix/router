@@ -198,7 +198,7 @@ impl ConditionResolverCache {
 /// Guard conditions from the underlying `ConditionResolverCache` still apply: entries are only
 /// cached when context is empty, excluded_conditions is empty, and extra_conditions is None.
 #[derive(Clone)]
-pub(crate) struct SharedConditionResolverCache {
+pub struct SharedConditionResolverCache {
     inner: Arc<Mutex<ConditionResolverCache>>,
 }
 
@@ -247,6 +247,52 @@ impl SharedConditionResolverCache {
         &self,
     ) -> IndexMap<SemanticEdgeId, (ConditionResolution, ExcludedDestinations)> {
         self.inner.lock().edge_states.clone()
+    }
+
+    /// Import cache entries from a previous schema version's cache.
+    ///
+    /// Only entries whose `SemanticEdgeId` exists in `new_graph` are imported.
+    /// Entries with non-None `path_tree` are skipped because the `OpPathTree`
+    /// references `NodeIndex`/`EdgeIndex` values from the old graph which would
+    /// be invalid in the new graph. These entries will be lazily recomputed on
+    /// first access.
+    ///
+    /// Returns the number of entries imported.
+    pub(crate) fn import_from(
+        &self,
+        old_cache: &SharedConditionResolverCache,
+        new_graph: &crate::query_graph::QueryGraph,
+    ) -> usize {
+        let old_entries = old_cache.entries();
+        let mut imported = 0;
+
+        let mut inner = self.inner.lock();
+        for (semantic_id, (resolution, excluded_destinations)) in old_entries {
+            // Skip if the edge no longer exists in the new graph
+            if new_graph.edge_index_for_semantic_id(&semantic_id).is_none() {
+                continue;
+            }
+
+            // Only import entries that don't reference old graph indices.
+            // Satisfied entries with path_tree: Some(...) contain NodeIndex/EdgeIndex
+            // from the old graph — these are not valid in the new graph.
+            let is_portable = match &resolution {
+                ConditionResolution::Unsatisfied { .. } => true,
+                ConditionResolution::Satisfied {
+                    path_tree: None, ..
+                } => true,
+                ConditionResolution::Satisfied {
+                    path_tree: Some(_), ..
+                } => false,
+            };
+
+            if is_portable {
+                inner.insert(semantic_id, resolution, excluded_destinations);
+                imported += 1;
+            }
+        }
+
+        imported
     }
 }
 

@@ -45,6 +45,7 @@ pub(crate) mod path_tree;
 
 pub use build_query_graph::build_federated_query_graph;
 pub use build_query_graph::build_supergraph_api_query_graph;
+pub use condition_resolver::SharedConditionResolverCache;
 use graph_path::operation::OpGraphPathContext;
 use graph_path::operation::OpGraphPathTrigger;
 use graph_path::operation::OpPathElement;

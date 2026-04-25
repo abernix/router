@@ -427,6 +427,24 @@ impl QueryPlanner {
         supergraph: &Supergraph,
         config: QueryPlannerConfig,
     ) -> Result<Self, FederationError> {
+        Self::new_with_previous_cache(supergraph, config, None)
+    }
+
+    /// Create a new `QueryPlanner`, optionally importing condition resolution cache entries
+    /// from a previous planner's cache (e.g., after a schema reload).
+    ///
+    /// Entries whose `SemanticEdgeId` exists in the new graph AND whose `ConditionResolution`
+    /// does not reference old graph indices (no `OpPathTree`) are imported. Entries with
+    /// path trees are skipped and lazily recomputed on first use.
+    #[cfg_attr(
+        feature = "snapshot_tracing",
+        tracing::instrument(level = "trace", skip_all, name = "QueryPlanner::new_with_previous_cache")
+    )]
+    pub fn new_with_previous_cache(
+        supergraph: &Supergraph,
+        config: QueryPlannerConfig,
+        previous_cache: Option<&SharedConditionResolverCache>,
+    ) -> Result<Self, FederationError> {
         let supergraph_schema = supergraph.schema.clone();
         let api_schema = supergraph.to_api_schema(ApiSchemaOptions {
             include_defer: config.incremental_delivery.enable_defer,
@@ -511,6 +529,14 @@ impl QueryPlanner {
             .map(|position| position.type_name().clone())
             .collect::<IndexSet<_>>();
 
+        let condition_resolver_cache = SharedConditionResolverCache::new();
+        if let Some(prev_cache) = previous_cache {
+            let imported = condition_resolver_cache.import_from(prev_cache, &query_graph);
+            trace!(
+                "Imported {imported} condition resolver cache entries from previous schema version"
+            );
+        }
+
         Ok(Self {
             config,
             federated_query_graph: Arc::new(query_graph),
@@ -518,7 +544,7 @@ impl QueryPlanner {
             api_schema,
             interface_types_with_interface_objects,
             abstract_types_with_inconsistent_runtime_types,
-            condition_resolver_cache: SharedConditionResolverCache::new(),
+            condition_resolver_cache,
         })
     }
 
@@ -759,6 +785,12 @@ impl QueryPlanner {
     /// Returns the number of cached condition resolutions. Useful for observability and testing.
     pub fn condition_resolver_cache_len(&self) -> usize {
         self.condition_resolver_cache.len()
+    }
+
+    /// Returns a reference to the shared condition resolver cache.
+    /// Used by the router layer to pass the cache to a new `QueryPlanner` during schema reload.
+    pub fn condition_resolver_cache(&self) -> &SharedConditionResolverCache {
+        &self.condition_resolver_cache
     }
 
     /// Returns a reference to the federated query graph. Useful for testing SemanticEdgeId stability.
