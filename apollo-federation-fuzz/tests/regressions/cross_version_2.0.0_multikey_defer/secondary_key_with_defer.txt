@@ -1,0 +1,162 @@
+iter=307 seed=17 sha1_prefix=007176e2a9e6
+summary: defer sub_selection (C) + defer Field repr (D)
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type Query {
+  qT0: T0
+  qT2: T2
+  qI0: I0
+}
+
+interface I0 {
+  id: ID!
+}
+
+type T0 implements I0 @key(fields: "id k0 k1") {
+  id: ID!
+  k0: String!
+  k1: String!
+  f0_0: Boolean!
+  f0_1: Int!
+  f0_2: String!
+  f0_3: Boolean!
+  f0_4: Int
+  r0_0: T1
+}
+
+type T1 implements I0 @key(fields: "id") @key(fields: "sk0") {
+  id: ID!
+  sk0: String!
+  f1_0: ID! @override(from: "s2")
+}
+
+type T2 implements I0 @key(fields: "id") @key(fields: "sk0") {
+  id: ID!
+  sk0: Int!
+  f2_0: ID!
+  f2_1: Int
+  f2_2: Boolean
+  r2_0: T0
+  r2_1: T1
+}
+
+
+# s1
+type Query {
+  qT1: T1
+}
+
+type T1 @key(fields: "id") @key(fields: "sk0") {
+  id: ID!
+  sk0: String!
+}
+
+
+# s2
+type T1 @key(fields: "id") @key(fields: "sk0") {
+  id: ID!
+  sk0: String!
+  f1_0: ID!
+}
+
+=== OPERATION ===
+query($__v0: Boolean!, $__v1: Boolean!) {
+  ... @skip(if: $__v0) {
+    ... {
+      ... @include(if: $__v0) {
+        qT0 {
+          ... @defer {
+            k1 @skip(if: $__v1)
+          }
+          f0_4
+          ...Frag0 @defer
+        }
+        qT0 {
+          id
+        }
+        qT0 @skip(if: $__v0) {
+          id
+          __typename
+        }
+        qT0 @include(if: $__v1) {
+          id
+          __typename
+        }
+        qT0 @include(if: $__v1) {
+          id
+          aS7: id @skip(if: $__v0)
+        }
+      }
+      qT0 {
+        id
+      }
+      qT0 @skip(if: $__v1) {
+        id
+      }
+      qT0 {
+        id
+      }
+      qT0 {
+        id
+      }
+      __typename
+    }
+  }
+  qT0 {
+    id
+    __typename
+  }
+  qT0 @skip(if: $__v1) {
+    id
+    aS8: id @skip(if: $__v0)
+  }
+  qT0 {
+    id
+    aS9: id @skip(if: $__v1)
+  }
+}
+
+fragment Frag0 on T0 {
+  ... on T0 {
+    fLfD_qEWVfnyhxcj8: f0_3 @include(if: $__v0)
+    ... @defer {
+      eYaIKpip5: k0
+      id
+      aS0: id @skip(if: $__v1)
+      NAKKUoptcMIvdaeQ7MqHw72: r0_0 @skip(if: $__v0) {
+        ... {
+          ... {
+            ... on T1 {
+              zDi6uvgAAAAAAAAAAAAAAAAAAAAAA1: sk0
+              id @include(if: $__v0)
+              id
+              aS5: id @skip(if: $__v1)
+              id @include(if: $__v1)
+              id
+              aS6: id @skip(if: $__v0)
+            }
+            id
+            id
+            id
+            id
+          }
+          id
+          aS3: id @skip(if: $__v1)
+          id
+          aS4: id @skip(if: $__v0)
+          id @include(if: $__v1)
+        }
+        id
+        aS1: id @skip(if: $__v0)
+        id @skip(if: $__v0)
+        aS2: id @skip(if: $__v0)
+      }
+      id @skip(if: $__v0)
+    }
+    id @skip(if: $__v1)
+  }
+  id
+  id @skip(if: $__v0)
+}

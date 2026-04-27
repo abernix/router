@@ -1,0 +1,144 @@
+iter=714 seed=17 sha1_prefix=9d53613f458f
+summary: (uncategorised diff — possible Class E)
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type Query {
+  qT0: T0
+}
+
+type T0 @key(fields: "id") @key(fields: "sk0") {
+  id: ID!
+  sk0: String!
+  r0_0: T1 @shareable
+}
+
+type T1 @key(fields: "id k0") {
+  id: ID!
+  k0: Int!
+}
+
+
+# s1
+type Query {
+  qT3: T3
+}
+
+type T0 @key(fields: "id") @key(fields: "sk0") {
+  id: ID!
+  sk0: String!
+  r0_0: T1 @shareable
+}
+
+type T3 @key(fields: "id") {
+  id: ID!
+  f3_0: Float!
+  f3_1: Float!
+  f3_2: ID!
+  f3_3: ID!
+  f3_4: Boolean!
+  r3_0: T0
+  r3_1: T0
+}
+
+type T1 @key(fields: "id k0") {
+  id: ID!
+  k0: Int!
+}
+
+
+# s2
+type Query {
+  qT1: T1
+  qT2: T2
+}
+
+type T0 @key(fields: "id") @key(fields: "sk0") {
+  id: ID!
+  sk0: String!
+}
+
+type T1 @key(fields: "id k0") @key(fields: "sk0") {
+  id: ID!
+  sk0: String!
+  k0: Int!
+  f1_0: Int!
+  f1_1: Boolean!
+  f1_2: Boolean!
+  f1_3: Boolean!
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+  f2_0: Float
+  f2_1: Int
+  f2_2: Int!
+  f2_3: ID
+  f2_4: Boolean!
+}
+
+=== OPERATION ===
+query($__v0: Boolean!, $__v1: Boolean!) {
+  qT2 {
+    ...Frag0
+    ... on T2 {
+      ... on T2 {
+        ... {
+          ... {
+            ...Frag2 @include(if: $__v1)
+            id
+            id @include(if: $__v1)
+            aS1: id @skip(if: $__v0)
+            id
+          }
+          __typename
+        }
+      }
+      __typename
+    }
+    id
+    id @skip(if: $__v0)
+    __typename
+  }
+  qT0 {
+    id
+  }
+  qT0 {
+    id
+  }
+}
+
+fragment Frag0 on T2 {
+  id
+  aS0: id @skip(if: $__v1)
+}
+
+fragment Frag1 on T2 {
+  f2_2
+  f2_2
+  XDxejR7B3enodjQE9h1c2: f2_0 @include(if: $__v0)
+}
+
+fragment Frag2 on T2 {
+  ... {
+    f2_0
+    f2_0
+    ... {
+      ... on T2 @skip(if: $__v1) {
+        foe7yjHJiCXe78UpCK0: f2_1
+        f2_0
+        aS2: f2_0 @skip(if: $__v0)
+      }
+    }
+    ... {
+      ...Frag1 @skip(if: $__v1)
+      ... on T2 @skip(if: $__v1) {
+        R1bkWHTf73TLQAAAAAAAAAA2: f2_0
+      }
+    }
+    id
+  }
+  id
+  __typename
+}

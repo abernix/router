@@ -1,0 +1,137 @@
+iter=885 seed=17 sha1_prefix=0acde338e4d9
+summary: PR #7580 + FED-505 Condition
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+schema {
+  query: Q
+}
+
+type Q {
+  qT1: T1
+  qT3: T3
+}
+
+type T1 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f1_0: String!
+  f1_2: ID
+  f1_3: Float! @override(from: "s1", label: "percent(35)")
+  f1_4: ID! @shareable
+}
+
+type T3 @key(fields: "id k0 k1") {
+  id: ID!
+  k0: ID!
+  k1: ID!
+}
+
+
+# s1
+schema {
+  query: Q
+}
+
+type Q {
+  qT2: T2
+}
+
+type T1 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f1_0: String! @external
+  f1_1: ID! @requires(fields: "f1_0")
+  f1_3: Float!
+  f1_4: ID! @shareable
+  r1_0: T0
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+  f2_0: ID!
+  f2_1: String!
+  f2_2: String!
+  r2_0: T0
+}
+
+type T0 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+}
+
+
+# s2
+schema {
+  query: Q
+}
+
+type Q {
+  qT0: T0
+}
+
+type T0 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f0_0: Boolean!
+  f0_1: Boolean!
+  f0_2: Float
+  f0_3: Int
+  r0_0: T2
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+}
+
+=== OPERATION ===
+query Iju8kdmw5iTXrWMghzW7rq($__v0: Boolean!, $__v1: Boolean!) {
+  ...Frag0 @skip(if: $__v0)
+  qT1 {
+    id
+  }
+  qT1 @include(if: $__v0) {
+    id
+  }
+  qT1 {
+    id
+    aS5: id @skip(if: $__v1)
+  }
+  __typename
+}
+
+fragment Frag0 on Query {
+  ... {
+    UNFh44: qT3 @include(if: $__v1) {
+      hl90_YpOXg4ojT2: k1
+    }
+  }
+  WZnUDqIMR1: qT1 @skip(if: $__v1) {
+    ... on T1 @skip(if: $__v0) {
+      FnCGHIiviAAAAAAAAAAAAAAAAAAAAA5: r1_0 {
+        id
+      }
+      id
+      aS2: id @skip(if: $__v1)
+      id
+      id
+    }
+    id
+    aS0: id @skip(if: $__v1)
+    id
+    id
+    aS1: id @skip(if: $__v1)
+    __typename
+  }
+  qT1 @skip(if: $__v0) {
+    id
+    aS3: id @skip(if: $__v0)
+    __typename
+  }
+  qT1 @include(if: $__v0) {
+    id
+    aS4: id @skip(if: $__v1)
+  }
+  __typename
+}

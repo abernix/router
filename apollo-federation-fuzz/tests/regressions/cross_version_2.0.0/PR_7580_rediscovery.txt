@@ -1,0 +1,63 @@
+iter=879 seed=42 sha1_prefix=df35e0bf033f
+summary: PR #7580
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type Query {
+  qT0: T0
+  qT1: T1
+}
+
+type T0 @key(fields: "id") {
+  id: ID!
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+  f1_0: String!
+}
+
+
+# s1
+type T1 @key(fields: "id") {
+  id: ID!
+}
+
+=== OPERATION ===
+query UsAYyN($__v0: Boolean!, $__v1: Boolean!) {
+  ... on Query @include(if: $__v1) {
+    ... on Query {
+      qT0 @skip(if: $__v0) {
+        rr7fzcHKq7b7cYqlUz0g0UqeSjcUg51: id @skip(if: $__v1)
+        id @include(if: $__v1)
+        ... on T0 @include(if: $__v1) {
+          id
+        }
+        m2jubr8TPec10: id @skip(if: $__v1)
+        id
+      }
+      oxt5KSbe_PAAAAAAAAAAAAAA2: qT1 {
+        id @include(if: $__v0)
+      }
+    }
+    qT0 {
+      id
+    }
+    qT0 {
+      id
+    }
+    qT0 @skip(if: $__v1) {
+      id @include(if: $__v1)
+    }
+  }
+  qT0 {
+    id @include(if: $__v1)
+  }
+  qT0 {
+    id
+  }
+  qT0 {
+    id @include(if: $__v1)
+  }
+}

@@ -1,0 +1,80 @@
+iter=52 seed=17 sha1_prefix=01bfd7cd7952
+summary: defer sub_selection (C) + defer Field repr (D)
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type Query {
+  qT0: T0 @provides(fields: "f0_0 f0_2")
+}
+
+type T0 @key(fields: "id") {
+  id: ID!
+  f0_0: Int! @external
+  f0_1: String
+  f0_2: Int @external
+  f0_3: Float @shareable
+}
+
+
+# s1
+type Query {
+  qI0: I0
+}
+
+interface I0 {
+  id: ID!
+}
+
+type T0 implements I0 @key(fields: "id") {
+  id: ID!
+  f0_0: Int! @external
+  f0_1: String @override(from: "s0", label: "percent(41)")
+  f0_2: Int @shareable @requires(fields: "f0_0")
+  f0_3: Float @shareable
+}
+
+
+# s2
+type Query {
+  qT1: T1
+}
+
+type T0 @key(fields: "id") {
+  id: ID!
+  f0_0: Int! @shareable
+  f0_3: Float @shareable
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+  f1_0: ID
+  f1_1: Int
+}
+
+
+# s3
+type T1 @key(fields: "id") {
+  id: ID!
+}
+
+=== OPERATION ===
+query($__v1: Boolean!) {
+  zvOkhmfZYtyUN47l2: qT0 @include(if: $__v1) {
+    DwVAdN4l4Ey7WRzJQ82: id
+    f0_2
+  }
+  qT0 {
+    f0_2
+    ... @defer {
+      id
+      f0_1
+      f0_3 @include(if: $__v1)
+      f0_3
+      id
+    }
+    mm5: f0_1
+    lypL9FkK4jeD5: f0_2
+    f0_3
+  }
+}

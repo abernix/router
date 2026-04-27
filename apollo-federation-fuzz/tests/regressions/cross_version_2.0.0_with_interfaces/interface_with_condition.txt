@@ -1,0 +1,96 @@
+iter=99 seed=17 sha1_prefix=17d7a1e3fb59
+summary: PR #7580 + FED-505 Condition
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type Query {
+  qT0: T0
+  qT1: T1
+}
+
+type T0 @key(fields: "id") {
+  id: ID!
+  f0_0: ID
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+  f1_0: String! @shareable
+  f1_1: Int @shareable
+  f1_2: Int @shareable
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+}
+
+
+# s1
+type Query {
+  qT2: T2
+  qI0: I0
+}
+
+interface I0 {
+  id: ID!
+}
+
+type T1 implements I0 @key(fields: "id") {
+  id: ID!
+  f1_0: String! @shareable
+  f1_2: Int @shareable
+}
+
+type T2 implements I0 @key(fields: "id") {
+  id: ID!
+  f2_0: Float
+}
+
+
+# s2
+type T1 @key(fields: "id") {
+  id: ID!
+}
+
+
+# s3
+type T1 @key(fields: "id") {
+  id: ID!
+  f1_0: String! @shareable
+  f1_1: Int @shareable
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+  f2_0: Float @override(from: "s1")
+}
+
+=== OPERATION ===
+query pVzSIJAudylaJKKdx1E41DLbO($__v0: Boolean!, $__v1: Boolean!) {
+  ... @include(if: $__v1) {
+    ... on Query @skip(if: $__v0) {
+      qT2 {
+        f2_0
+      }
+    }
+  }
+  Btuf1: qI0 {
+    id
+    ... on I0 {
+      zgdfD7gUUycb4PfdROl50: id
+      id
+      Nu949XRTzAAAAAAAAA0: id
+      id
+    }
+  }
+  qT0 {
+    id @include(if: $__v1)
+  }
+  qT0 {
+    id
+  }
+  qT0 @include(if: $__v0) {
+    id
+  }
+}

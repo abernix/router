@@ -1,0 +1,186 @@
+iter=724 seed=17 sha1_prefix=004f935b393e
+summary: FED-505 Condition + defer sub_selection (C) + defer Field repr (D)
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type Query {
+  qT4: T4 @provides(fields: "f4_0")
+  qI0: I0
+}
+
+interface I0 {
+  id: ID!
+}
+
+type T0 implements I0 @key(fields: "id k0 k1") {
+  id: ID!
+  k0: Int!
+  k1: Int!
+  f0_0: ID! @shareable
+}
+
+type T2 implements I0 @key(fields: "id") {
+  id: ID!
+  f2_1: ID
+  f2_2: String!
+  r2_1: T5
+}
+
+type T3 @key(fields: "id") {
+  id: ID!
+  f3_0: Float! @shareable
+  r3_0: T1 @shareable
+}
+
+type T4 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f4_0: Float @external
+  f4_1: ID! @shareable
+  f4_3: Int! @shareable
+  f4_4: Float!
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+}
+
+type T5 @key(fields: "id") {
+  id: ID!
+}
+
+
+# s1
+type Query {
+  qT0: T0
+  qT1: T1
+  qT3: T3
+  qT5: T5
+}
+
+type T0 @key(fields: "id k0 k1") {
+  id: ID!
+  k0: Int!
+  k1: Int!
+  f0_0: ID! @shareable
+  f0_1: ID!
+  f0_2: ID @override(from: "s3", label: "percent(94)")
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+  r1_0: T2 @shareable
+}
+
+type T3 @key(fields: "id") {
+  id: ID!
+  f3_1: ID!
+  r3_0: T1 @shareable
+  r3_1: T0
+}
+
+type T5 @key(fields: "id") {
+  id: ID!
+  f5_0: Int! @shareable
+  f5_2: ID @shareable
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+}
+
+
+# s2
+type Query {
+  qT2: T2
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+  f2_0: String
+  r2_0: T1
+}
+
+type T3 @key(fields: "id") {
+  id: ID!
+  f3_0: Float! @shareable
+}
+
+type T4 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f4_0: Float @shareable
+  f4_1: ID! @shareable
+  r4_0: T5 @shareable
+}
+
+type T5 @key(fields: "id") {
+  id: ID!
+  f5_0: Int! @shareable
+  f5_1: Float!
+  f5_2: ID @shareable
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+}
+
+
+# s3
+type T0 @key(fields: "id k0 k1") {
+  id: ID!
+  k0: Int!
+  k1: Int!
+  f0_0: ID! @shareable
+  f0_2: ID
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+  r1_0: T2 @shareable
+}
+
+type T4 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f4_1: ID! @shareable
+  f4_2: Boolean!
+  f4_3: Int! @shareable
+  r4_0: T5 @shareable
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+}
+
+type T5 @key(fields: "id") {
+  id: ID!
+}
+
+=== OPERATION ===
+query($__v0: Boolean!, $__v1: Boolean!) {
+  zuqhu9YnyrGEiN0OAyJ5: qT3 {
+    O6DnQKg_XDaHn2: r3_0 {
+      WSB90: id @include(if: $__v0)
+      ... on T1 {
+        r1_0 @skip(if: $__v1) {
+          f2_0
+          f2_1
+        }
+        Sqx91vEzrhSM2: r1_0 {
+          ... @defer {
+            f2_1
+            ijLIIYNAAAAAAAAAAAAAAAAAAAAAA3: f2_0 @include(if: $__v1)
+          }
+          id
+          id @skip(if: $__v1)
+        }
+      }
+    }
+    id
+  }
+  qT4 {
+    id @skip(if: $__v0)
+  }
+}

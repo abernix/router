@@ -1,0 +1,128 @@
+iter=753 seed=23 sha1_prefix=0c47565b58f1
+summary: PR #7580 + FED-505 Condition
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type Query {
+  qT0: T0
+  qT3: T3
+}
+
+type T0 @key(fields: "id") {
+  id: ID!
+  f0_0: Int
+  f0_1: Float!
+  f0_3: Int!
+}
+
+type T3 @key(fields: "id") {
+  id: ID!
+  f3_0: Int!
+  f3_1: ID
+  f3_2: ID!
+}
+
+
+# s1
+type Query {
+  qT1: T1
+  qT2: T2
+}
+
+type T0 @key(fields: "id") {
+  id: ID!
+  f0_1: Float! @override(from: "s0")
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+  f1_0: ID!
+  f1_1: Int! @shareable
+  f1_2: String!
+  f1_3: ID! @shareable
+  f1_4: Boolean!
+}
+
+type T2 @key(fields: "id") {
+  id: ID!
+  f2_0: Boolean
+}
+
+
+# s2
+type Query {
+  qI0: I0
+}
+
+interface I0 {
+  id: ID!
+}
+
+type T0 implements I0 @key(fields: "id") {
+  id: ID!
+  f0_2: Int! @requires(fields: "f0_3")
+  f0_3: Int! @external
+}
+
+type T1 @key(fields: "id") {
+  id: ID!
+  f1_1: Int! @shareable
+  f1_3: ID! @shareable
+  f1_4: Boolean! @override(from: "s1")
+}
+
+=== OPERATION ===
+query uV3ZXTIZ3sBk($__v0: Boolean!, $__v1: Boolean!) {
+  ... on Query {
+    ... on Query @skip(if: $__v0) {
+      suzw_9QX2: qT0 {
+        gGu4cFhAPu0: id
+        f0_2
+      }
+      avTIOrQ7qV6r8by5: qT0 {
+        ... {
+          SFE0: id @skip(if: $__v1)
+          f0_1
+          lc74: f0_2 @skip(if: $__v1)
+          ... {
+            jnztAAAAAAAAAAAAAAAAAAAAAA2: f0_3
+            id @skip(if: $__v0)
+            id
+            id @include(if: $__v1)
+          }
+        }
+      }
+      qT0 @skip(if: $__v1) {
+        id
+      }
+      qT0 @include(if: $__v1) {
+        id
+      }
+      qT0 @skip(if: $__v0) {
+        id @skip(if: $__v1)
+      }
+    }
+    qT0 {
+      id @include(if: $__v0)
+    }
+    qT0 {
+      id @include(if: $__v1)
+    }
+    qT0 {
+      id
+    }
+    qT0 {
+      id
+    }
+  }
+  qT0 {
+    id @include(if: $__v1)
+  }
+  qT0 @include(if: $__v1) {
+    id
+  }
+  qT0 @skip(if: $__v1) {
+    id @include(if: $__v1)
+  }
+}

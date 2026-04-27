@@ -1,0 +1,132 @@
+iter=565 seed=17 sha1_prefix=0066e2f2ac61
+summary: PR #7580 + FED-505 Condition + defer sub_selection (C) + defer Field repr (D)
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type Query {
+  qT0: T0
+  qT1: T1
+  qT2: T2
+}
+
+type I0 @key(fields: "id") @interfaceObject {
+  id: ID!
+  io0: String!
+}
+
+type T0 @key(fields: "id") {
+  id: ID!
+  f0_0: ID!
+  f0_1: Float!
+  f0_2: String!
+  f0_3: Float!
+  f0_4: ID!
+}
+
+type T1 @key(fields: "id k0 k1") {
+  id: ID!
+  k0: Int!
+  k1: String!
+  f1_0: Float!
+  f1_1: Boolean!
+  f1_2: Int!
+  f1_3: String
+}
+
+type T2 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f2_0: Int
+  f2_1: Float
+}
+
+
+# s1
+type Query {
+  qT3: T3
+  qI0: I0
+}
+
+interface I0 @key(fields: "id") {
+  id: ID!
+}
+
+type T3 implements I0 @key(fields: "id k0 k1") @key(fields: "id") {
+  id: ID!
+  k0: String!
+  k1: String!
+  f3_0: Float!
+  f3_1: String!
+  f3_2: Boolean!
+  f3_3: Boolean
+  f3_4: ID!
+}
+
+=== OPERATION ===
+query($__v0: Boolean!, $__v1: Boolean!) {
+  ... on Query {
+    qT3 {
+      z5: f3_3 @include(if: $__v0)
+      id @include(if: $__v1)
+      sjcgDWKXFqs28: k0
+    }
+  }
+  ... on Query @defer {
+    qT2 {
+      ... on T2 @defer {
+        ... {
+          k0
+          k0 @skip(if: $__v0)
+          MvoCz0: k0
+          ... on T2 {
+            ... {
+              MBuw8H0: f2_1 @skip(if: $__v0)
+              lg28Ls1: k0
+              ... @skip(if: $__v1) {
+                ... {
+                  f2_0 @include(if: $__v1)
+                  ... @defer {
+                    id @include(if: $__v1)
+                    AwfPcmFRM3_UCG4gVkIAAAAAAAAA2: f2_1
+                    id @skip(if: $__v0)
+                    id
+                  }
+                }
+              }
+              id
+              id @include(if: $__v0)
+            }
+            id
+            id
+            id
+            id
+          }
+          id @skip(if: $__v1)
+        }
+        id
+        id
+        id @skip(if: $__v0)
+      }
+      id
+    }
+    qT0 {
+      id
+    }
+    qT0 {
+      id
+    }
+    qT0 {
+      id
+    }
+    qT0 @include(if: $__v0) {
+      id
+    }
+  }
+  qT0 {
+    id @skip(if: $__v1)
+  }
+  qT0 @skip(if: $__v1) {
+    id
+  }
+}

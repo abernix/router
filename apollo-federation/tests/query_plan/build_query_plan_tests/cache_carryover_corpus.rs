@@ -3,11 +3,15 @@
 //! These tests load ALL pre-composed supergraph fixtures (202 files) and verify
 //! that cache carryover via `new_with_previous_cache()` never corrupts plans.
 //!
-//! Two test strategies:
+//! Test strategies:
 //! 1. Same-schema carryover: V1 plans queries, V2 is built from the same schema
 //!    with V1's cache. Plans must be identical.
 //! 2. Warm-cache replay: Plan queries, then re-plan via the same planner. The
 //!    second plan (using cached condition resolutions) must match the first.
+//! 3. Schema mutation carryover: V1 plans queries, schema is mutated (field
+//!    added), V2 is built from the mutated schema with V1's cache. V2 plans
+//!    must match a fresh V2 planner (no carryover) — proving carried-over
+//!    entries don't corrupt plans after schema changes.
 //!
 //! Run with: cargo test -p apollo-federation -- cache_carryover_corpus --nocapture
 
@@ -15,6 +19,23 @@ use apollo_federation::query_plan::query_planner::QueryPlanOptions;
 use apollo_federation::query_plan::query_planner::QueryPlanner;
 use apollo_federation::query_plan::query_planner::QueryPlannerConfig;
 use apollo_federation::Supergraph;
+
+/// Reads all `.graphql` supergraph fixtures, sorted by filename.
+fn load_supergraph_entries() -> Vec<std::fs::DirEntry> {
+    let supergraphs_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SUPERGRAPHS_DIR);
+    let mut entries: Vec<_> = std::fs::read_dir(&supergraphs_dir)
+        .unwrap_or_else(|e| panic!("Cannot read {}: {e}", supergraphs_dir.display()))
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map_or(false, |ext| ext == "graphql")
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    entries
+}
 
 const SUPERGRAPHS_DIR: &str = "tests/query_plan/supergraphs";
 
@@ -107,19 +128,7 @@ fn generate_queries_for_schema(
 /// This is the broadest correctness test: 202 supergraph fixtures × auto-generated queries.
 #[test]
 fn carryover_produces_identical_plans_across_corpus() {
-    let supergraphs_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SUPERGRAPHS_DIR);
-
-    let mut entries: Vec<_> = std::fs::read_dir(&supergraphs_dir)
-        .unwrap_or_else(|e| panic!("Cannot read {}: {e}", supergraphs_dir.display()))
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "graphql")
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
+    let entries = load_supergraph_entries();
 
     let mut total_schemas = 0;
     let mut total_queries_tested = 0;
@@ -262,19 +271,7 @@ fn carryover_produces_identical_plans_across_corpus() {
 /// condition resolver cache never changes plan output.
 #[test]
 fn warm_cache_replay_produces_identical_plans_across_corpus() {
-    let supergraphs_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SUPERGRAPHS_DIR);
-
-    let mut entries: Vec<_> = std::fs::read_dir(&supergraphs_dir)
-        .unwrap_or_else(|e| panic!("Cannot read {}: {e}", supergraphs_dir.display()))
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "graphql")
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
+    let entries = load_supergraph_entries();
 
     let mut total_schemas = 0;
     let mut total_queries_tested = 0;
@@ -386,19 +383,7 @@ fn warm_cache_replay_produces_identical_plans_across_corpus() {
 /// pollution produces different plans after carryover.
 #[test]
 fn carryover_with_interleaved_queries_across_corpus() {
-    let supergraphs_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SUPERGRAPHS_DIR);
-
-    let mut entries: Vec<_> = std::fs::read_dir(&supergraphs_dir)
-        .unwrap_or_else(|e| panic!("Cannot read {}: {e}", supergraphs_dir.display()))
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "graphql")
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
+    let entries = load_supergraph_entries();
 
     let mut total_schemas = 0;
     let mut total_queries_tested = 0;
@@ -533,4 +518,300 @@ fn carryover_with_interleaved_queries_across_corpus() {
             failures.len()
         );
     }
+}
+
+/// Mutate a supergraph SDL by adding a new leaf field to the first non-Query
+/// object type that has a `@join__field` directive. Returns `None` if the
+/// schema can't be mutated (e.g., no suitable type found).
+///
+/// The mutation adds `_carryoverTestField: String @join__field(graph: <FIRST_GRAPH>)`
+/// to the first eligible type. This is a minimal, non-breaking schema change
+/// that exercises cache carryover across a real schema delta.
+fn mutate_supergraph_add_field(schema_sdl: &str) -> Option<String> {
+    // Extract the first join__Graph enum value (e.g., "SUBGRAPH1")
+    // Must be inside the `enum join__Graph { ... }` block, not the directive definition
+    let graph_enum_value = {
+        let mut in_enum = false;
+        let mut found = None;
+        for line in schema_sdl.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("enum join__Graph") {
+                in_enum = true;
+                continue;
+            }
+            if in_enum {
+                if trimmed == "}" {
+                    break;
+                }
+                // Lines look like: SUBGRAPH1 @join__graph(name: "Subgraph1", url: "none")
+                if trimmed.contains("@join__graph(") {
+                    if let Some(name) = trimmed.split_whitespace().next() {
+                        found = Some(name.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        found?
+    };
+
+    // Find the first non-Query, non-Mutation, non-Subscription object type
+    // that has fields with @join__field. We look for a closing `}` after a
+    // `type Foo` block that isn't a root type.
+    let mut result = String::with_capacity(schema_sdl.len() + 200);
+    let mut inserted = false;
+    let mut in_eligible_type = false;
+    let mut brace_depth = 0u32;
+
+    for line in schema_sdl.lines() {
+        let trimmed = line.trim();
+
+        // Detect type definitions
+        if !inserted && trimmed.starts_with("type ") && !trimmed.starts_with("type Query")
+            && !trimmed.starts_with("type Mutation")
+            && !trimmed.starts_with("type Subscription")
+        {
+            // Check it has @join__type (it's a federated type, not a helper)
+            if trimmed.contains("@join__type") || {
+                // The @join__type might be on the next line(s)
+                // Heuristic: if this is a real entity type, we'll see @join__field in its body
+                true
+            } {
+                in_eligible_type = true;
+                brace_depth = 0;
+            }
+        }
+
+        if in_eligible_type {
+            brace_depth += trimmed.matches('{').count() as u32;
+            brace_depth = brace_depth.saturating_sub(trimmed.matches('}').count() as u32);
+
+            // Insert our field just before the closing brace of the first eligible type
+            if brace_depth == 0 && trimmed.contains('}') && !inserted {
+                result.push_str(&format!(
+                    "  _carryoverTestField: String @join__field(graph: {})\n",
+                    graph_enum_value
+                ));
+                inserted = true;
+                in_eligible_type = false;
+            }
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    if inserted {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// The critical test: schema changes with cache carryover.
+///
+/// For each supergraph fixture:
+/// 1. Build planner V1, plan queries to populate the condition cache
+/// 2. Mutate the schema (add a field to a type)
+/// 3. Build planner V2-fresh from mutated schema (no cache) — this is the reference
+/// 4. Build planner V2-carryover from mutated schema WITH V1's cache
+/// 5. Assert: V2-carryover plans == V2-fresh plans for all queries
+///
+/// This proves that carried-over cache entries from the old schema don't cause
+/// the new planner to produce different (wrong) plans. The comparison is against
+/// a fresh V2, not against V1 — because the schema changed, V1's plans may
+/// legitimately differ from V2's.
+#[test]
+fn carryover_across_schema_mutation_matches_fresh_planner() {
+    let entries = load_supergraph_entries();
+
+    let mut total_schemas = 0;
+    let mut total_queries_tested = 0;
+    let mut mutated_schemas = 0;
+    let mut cache_entries_imported = 0;
+    let mut failures: Vec<String> = Vec::new();
+
+    for entry in &entries {
+        let path = entry.path();
+        let name = path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let schema_str = std::fs::read_to_string(&path).unwrap();
+
+        // Parse V1 supergraph
+        let supergraph_v1 = match Supergraph::new(&schema_str) {
+            Ok(sg) => sg,
+            Err(_) => continue,
+        };
+
+        let api_v1 = match supergraph_v1
+            .to_api_schema(apollo_federation::ApiSchemaOptions::default())
+        {
+            Ok(api) => api,
+            Err(_) => continue,
+        };
+
+        let planner_v1 = match QueryPlanner::new(&supergraph_v1, QueryPlannerConfig::default()) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        total_schemas += 1;
+
+        // Generate and plan queries through V1 to populate cache
+        let queries = generate_queries_for_schema(&api_v1, 10);
+        let mut valid_queries: Vec<(
+            String,
+            apollo_compiler::validation::Valid<apollo_compiler::ExecutableDocument>,
+        )> = Vec::new();
+
+        for query_str in &queries {
+            let doc = match apollo_compiler::ExecutableDocument::parse_and_validate(
+                api_v1.schema(),
+                query_str,
+                "corpus_test.graphql",
+            ) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            // Plan through V1 to populate cache
+            if planner_v1
+                .build_query_plan(&doc, None, QueryPlanOptions::default())
+                .is_ok()
+            {
+                valid_queries.push((query_str.clone(), doc));
+            }
+        }
+
+        if valid_queries.is_empty() {
+            continue;
+        }
+
+        // Mutate the schema
+        let mutated_sdl = match mutate_supergraph_add_field(&schema_str) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Parse mutated schema — if mutation broke the schema, skip
+        let supergraph_v2 = match Supergraph::new(&mutated_sdl) {
+            Ok(sg) => sg,
+            Err(_) => continue,
+        };
+
+        let api_v2 = match supergraph_v2
+            .to_api_schema(apollo_federation::ApiSchemaOptions::default())
+        {
+            Ok(api) => api,
+            Err(_) => continue,
+        };
+
+        mutated_schemas += 1;
+
+        // Build V2-fresh (no carryover) — the reference planner
+        let planner_v2_fresh =
+            match QueryPlanner::new(&supergraph_v2, QueryPlannerConfig::default()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+        // Build V2-carryover (with V1's cache)
+        let planner_v2_carryover = match QueryPlanner::new_with_previous_cache(
+            &supergraph_v2,
+            QueryPlannerConfig::default(),
+            Some(planner_v1.condition_resolver_cache()),
+        ) {
+            Ok(p) => p,
+            Err(_) => {
+                failures.push(format!(
+                    "V2-carryover construction failed for [{name}]"
+                ));
+                continue;
+            }
+        };
+
+        cache_entries_imported += planner_v2_carryover.condition_resolver_cache_len();
+
+        // Re-validate queries against V2's API schema (the mutation might have
+        // changed the schema in a way that makes some queries invalid, though
+        // adding a field shouldn't)
+        for (query_str, _) in &valid_queries {
+            let doc = match apollo_compiler::ExecutableDocument::parse_and_validate(
+                api_v2.schema(),
+                query_str,
+                "corpus_test.graphql",
+            ) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            // Plan through V2-fresh (reference)
+            let fresh_plan = match planner_v2_fresh
+                .build_query_plan(&doc, None, QueryPlanOptions::default())
+            {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // Plan through V2-carryover (test subject)
+            let carryover_plan = match planner_v2_carryover
+                .build_query_plan(&doc, None, QueryPlanOptions::default())
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    failures.push(format!(
+                        "V2-carryover planning failed for [{name}] query: {query_str}: {e}"
+                    ));
+                    continue;
+                }
+            };
+
+            let fresh_str = fresh_plan.to_string();
+            let carryover_str = carryover_plan.to_string();
+
+            if fresh_str != carryover_str {
+                failures.push(format!(
+                    "SCHEMA MUTATION CARRYOVER MISMATCH in [{name}] query: {query_str}\n  \
+                     Fresh:     {fresh_str}\n  \
+                     Carryover: {carryover_str}"
+                ));
+            }
+
+            total_queries_tested += 1;
+        }
+    }
+
+    eprintln!(
+        "\n--- Schema mutation carryover corpus test ---\n  \
+         Schemas tested: {total_schemas}\n  \
+         Schemas successfully mutated: {mutated_schemas}\n  \
+         Total cache entries imported across all V2 planners: {cache_entries_imported}\n  \
+         Queries tested: {total_queries_tested}\n  \
+         Failures: {}\n",
+        failures.len()
+    );
+
+    if !failures.is_empty() {
+        for f in &failures[..failures.len().min(10)] {
+            eprintln!("  {f}\n");
+        }
+        panic!(
+            "{} schema mutation carryover mismatches found",
+            failures.len()
+        );
+    }
+
+    // Sanity: we should have successfully mutated and tested a good fraction
+    assert!(
+        mutated_schemas >= 50,
+        "Expected to successfully mutate at least 50 schemas, only mutated {mutated_schemas}"
+    );
+    assert!(
+        total_queries_tested >= 100,
+        "Expected to test at least 100 queries after mutation, only tested {total_queries_tested}"
+    );
 }

@@ -1,0 +1,86 @@
+iter=922 seed=17 sha1_prefix=33cb595e4178
+summary: PR #7580 + FED-505 Condition
+summary: (no diff captured)
+
+=== SUBGRAPHS ===
+# s0
+type T1 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f1_0: ID
+  f1_1: String
+  f1_2: String! @shareable
+}
+
+
+# s1
+type Query {
+  qT0: T0
+  qT1: T1
+  qI0: I0
+}
+
+interface I0 {
+  id: ID!
+}
+
+type T0 implements I0 @key(fields: "id") {
+  id: ID!
+}
+
+type T1 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f1_2: String! @shareable
+}
+
+
+# s2
+type T0 @key(fields: "id") {
+  id: ID!
+}
+
+type T1 @key(fields: "id k0") {
+  id: ID!
+  k0: String!
+  f1_0: ID @override(from: "s0", label: "percent(52)")
+  f1_2: String! @shareable
+}
+
+=== OPERATION ===
+query e9dOV4XPu($__v0: Boolean!, $__v1: Boolean!) {
+  qI0 {
+    ... {
+      id
+      ... {
+        ... {
+          id
+          w3npWlxLEf0: id @include(if: $__v0)
+        }
+      }
+      ... {
+        id @skip(if: $__v0)
+        id
+      }
+    }
+  }
+  ... on Query @skip(if: $__v1) {
+    gf4fzLEo4lzSd2Md6v23: qT1 {
+      id
+      FIwy4TUPtWCfxWGK2: f1_1
+      f1_1
+    }
+    qT0 @skip(if: $__v1) {
+      id
+    }
+    qT0 @include(if: $__v0) {
+      id
+    }
+    qT0 {
+      id
+    }
+    qT0 {
+      id
+    }
+  }
+}
