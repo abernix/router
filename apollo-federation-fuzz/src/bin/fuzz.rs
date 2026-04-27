@@ -2,15 +2,23 @@
 //! from a deterministic seed stream, runs each through the diff harness,
 //! and prints aggregate stats. Saves a reproducer JSON for any divergence.
 //!
-//! Two report modes:
+//! Report modes:
 //!   --report correctness   (default) — runs `run_diff`, saves divergences
 //!                                       and panics, exit 1 on divergence
 //!   --report perf          — builds both planners once per schema, times
 //!                            each `plan()` per op with randomised
 //!                            head/base order, prints distribution stats
+//!   --report warm          — HEAD-only: plans each op N times through the
+//!                            same planner, reports cold (1st) vs warm (2nd+)
+//!                            timing + cache stats + allocation counts
+//!   --report carryover     — HEAD-only: builds V1, plans ops to warm cache,
+//!                            builds V2 with cache carryover (same or mutated
+//!                            schema), asserts V2 plans match reference
 
-use std::path::PathBuf;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use arbitrary::Unstructured;
@@ -19,13 +27,74 @@ use clap::ValueEnum;
 use serde_json::Value;
 
 use apollo_federation_fuzz::compose::{ComposeOutcome, try_compose};
-use apollo_federation_fuzz::diff::{DiffOutcome, normalize as normalize_plan, run_diff};
+use apollo_federation_fuzz::diff::{normalize as normalize_plan, run_diff, DiffOutcome};
 use apollo_federation_fuzz::harness::{CommonConfig, CommonOptions, PlannerHarness};
-use apollo_federation_fuzz::op_gen::{OpGenConfig, generate_operation_with_config};
+use apollo_federation_fuzz::op_gen::{generate_operation_with_config, OpGenConfig};
 use apollo_federation_fuzz::subgraph_gen::{
-    GenConfig, SubgraphSdl, generate_federated_subgraphs, smoke_test_fixture,
+    generate_federated_subgraphs, smoke_test_fixture, GenConfig, SubgraphSdl,
 };
 use apollo_federation_fuzz::{BasePlanner, HeadPlanner};
+
+// ---------------------------------------------------------------------------
+// Counting allocator — tracks bytes allocated between reset/snapshot calls.
+// Zero overhead when not actively measuring (just an atomic increment).
+// ---------------------------------------------------------------------------
+
+struct CountingAllocator;
+
+static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACKING_ENABLED: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if TRACKING_ENABLED.load(Ordering::Relaxed) != 0 {
+            ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+#[derive(Clone, Copy)]
+struct AllocSnapshot {
+    bytes: u64,
+    count: u64,
+}
+
+fn alloc_start_tracking() {
+    ALLOC_BYTES.store(0, Ordering::Relaxed);
+    ALLOC_COUNT.store(0, Ordering::Relaxed);
+    TRACKING_ENABLED.store(1, Ordering::Relaxed);
+}
+
+fn alloc_snapshot() -> AllocSnapshot {
+    AllocSnapshot {
+        bytes: ALLOC_BYTES.load(Ordering::Relaxed),
+        count: ALLOC_COUNT.load(Ordering::Relaxed),
+    }
+}
+
+fn alloc_stop_tracking() -> AllocSnapshot {
+    TRACKING_ENABLED.store(0, Ordering::Relaxed);
+    alloc_snapshot()
+}
+
+fn alloc_reset() {
+    ALLOC_BYTES.store(0, Ordering::Relaxed);
+    ALLOC_COUNT.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum ReportMode {
@@ -35,6 +104,16 @@ enum ReportMode {
     /// Time `plan()` on both sides; report distribution stats. Skips
     /// reproducer saves. Useful for "is HEAD faster than BASE?" runs.
     Perf,
+    /// HEAD-only warm-cache measurement. Plans each operation multiple
+    /// times through the same planner instance and reports cold (1st
+    /// call) vs warm (subsequent) timing, allocation counts, and cache
+    /// entry growth.
+    Warm,
+    /// HEAD-only cache carryover correctness. Builds V1 planner, plans
+    /// ops to populate condition cache, builds V2 with carryover,
+    /// asserts V2 plans match a fresh V2 (no carryover). Tests that
+    /// carried-over cache entries don't corrupt plans.
+    Carryover,
 }
 
 #[derive(Parser, Debug)]
@@ -70,6 +149,90 @@ struct Args {
     /// Report mode. See ReportMode docs above.
     #[arg(long, value_enum, default_value_t = ReportMode::Correctness)]
     report: ReportMode,
+
+    // --- Schema complexity knobs ---
+
+    /// Minimum subgraphs per generated schema.
+    #[arg(long)]
+    min_subgraphs: Option<usize>,
+    /// Maximum subgraphs per generated schema.
+    #[arg(long)]
+    max_subgraphs: Option<usize>,
+    /// Minimum entity types per generated schema.
+    #[arg(long)]
+    min_entities: Option<usize>,
+    /// Maximum entity types per generated schema.
+    #[arg(long)]
+    max_entities: Option<usize>,
+    /// Maximum non-key fields per entity type.
+    #[arg(long)]
+    max_fields_per_entity: Option<usize>,
+    /// Probability (0-255) that an entity gets a @requires link. Higher =
+    /// more cross-subgraph condition edges = more condition cache activity.
+    #[arg(long)]
+    requires_chance: Option<u8>,
+    /// Probability (0-255) for @provides on root fields.
+    #[arg(long)]
+    provides_chance: Option<u8>,
+    /// Probability (0-255) for inter-entity reference fields.
+    #[arg(long)]
+    inter_entity_ref_chance: Option<u8>,
+    /// Probability (0-255) for compound (multi-field) keys.
+    #[arg(long)]
+    compound_key_chance: Option<u8>,
+    /// Probability (0-255) for a second @key on entities.
+    #[arg(long)]
+    multiple_key_chance: Option<u8>,
+
+    // --- Warm-mode specific ---
+
+    /// Number of times to re-plan each operation in warm mode (default 5).
+    #[arg(long, default_value_t = 5)]
+    warm_repeats: usize,
+
+    // --- Carryover-mode specific ---
+
+    /// In carryover mode, mutate the schema between V1 and V2 (add a field).
+    /// When false, V2 uses the identical schema — tests same-schema carryover.
+    #[arg(long, default_value_t = false)]
+    mutate_schema: bool,
+}
+
+impl Args {
+    fn gen_config(&self) -> GenConfig {
+        let mut cfg = GenConfig::default();
+        if let Some(v) = self.min_subgraphs {
+            cfg.min_subgraphs = v;
+        }
+        if let Some(v) = self.max_subgraphs {
+            cfg.max_subgraphs = v;
+        }
+        if let Some(v) = self.min_entities {
+            cfg.min_entities = v;
+        }
+        if let Some(v) = self.max_entities {
+            cfg.max_entities = v;
+        }
+        if let Some(v) = self.max_fields_per_entity {
+            cfg.max_fields_per_entity = v;
+        }
+        if let Some(v) = self.requires_chance {
+            cfg.requires_chance = v;
+        }
+        if let Some(v) = self.provides_chance {
+            cfg.provides_chance = v;
+        }
+        if let Some(v) = self.inter_entity_ref_chance {
+            cfg.inter_entity_ref_chance = v;
+        }
+        if let Some(v) = self.compound_key_chance {
+            cfg.compound_key_chance = v;
+        }
+        if let Some(v) = self.multiple_key_chance {
+            cfg.multiple_key_chance = v;
+        }
+        cfg
+    }
 }
 
 #[derive(Default, Debug)]
@@ -92,15 +255,26 @@ fn main() {
         ..CommonConfig::default()
     };
     let opts = CommonOptions::default();
-    let gen_cfg = GenConfig::default();
+    let gen_cfg = args.gen_config();
     let op_cfg = OpGenConfig {
         defer_chance: if args.enable_defer { 64 } else { 0 },
         ..OpGenConfig::default()
     };
 
-    if args.report == ReportMode::Perf {
-        run_perf_mode(args, cfg, opts, gen_cfg, op_cfg);
-        return;
+    match args.report {
+        ReportMode::Perf => {
+            run_perf_mode(args, cfg, opts, gen_cfg, op_cfg);
+            return;
+        }
+        ReportMode::Warm => {
+            run_warm_mode(args, cfg, opts, gen_cfg, op_cfg);
+            return;
+        }
+        ReportMode::Carryover => {
+            run_carryover_mode(args, cfg, opts, gen_cfg, op_cfg);
+            return;
+        }
+        ReportMode::Correctness => {}
     }
 
     let mut stats = Stats::default();
@@ -109,8 +283,7 @@ fn main() {
     let mut ops_done_for_schema: u64 = 0;
 
     for i in 0..args.iterations {
-        let need_new_schema = args.smoke_fixture
-            && current_schema.is_none()
+        let need_new_schema = args.smoke_fixture && current_schema.is_none()
             || (!args.smoke_fixture
                 && (current_schema.is_none() || ops_done_for_schema >= args.ops_per_schema));
 
@@ -165,13 +338,7 @@ fn main() {
             }
         };
 
-        let outcome = run_diff::<HeadPlanner, BasePlanner>(
-            supergraph_sdl,
-            &op_text,
-            None,
-            &cfg,
-            &opts,
-        );
+        let outcome = run_diff::<HeadPlanner, BasePlanner>(supergraph_sdl, &op_text, None, &cfg, &opts);
         ops_done_for_schema += 1;
 
         match outcome {
@@ -209,9 +376,7 @@ fn main() {
                 ..
             } => {
                 stats.panicked += 1;
-                let summary = format!(
-                    "head_panic={head_panic:?}\nbase_panic={base_panic:?}\n",
-                );
+                let summary = format!("head_panic={head_panic:?}\nbase_panic={base_panic:?}\n",);
                 let id = save_regression(
                     &args.regressions_dir,
                     i,
@@ -248,13 +413,7 @@ fn next_bytes(state: &mut u64, n: usize) -> Vec<u8> {
 }
 
 /// Saves a divergence/panic reproducer in the slim format consumed by
-/// `tests/regression_replay.rs`. The supergraph SDL and the unified diff
-/// are intentionally NOT stored: the supergraph is deterministic from
-/// the subgraphs + composer, and the diff is regenerated by re-running
-/// both planners. A short `summary:` header captures the kind of
-/// finding so the file remains human-readable; full detail lives in
-/// `unified_diff` while the run is in progress and is logged to stdout
-/// from the call site for live inspection.
+/// `tests/regression_replay.rs`.
 fn save_regression(
     dir: &PathBuf,
     iter: u64,
@@ -287,9 +446,6 @@ fn save_regression(
     id
 }
 
-/// Best-effort one-line tag for the `summary:` header. Mirrors the
-/// classification logic in `scripts/slim_regressions.py` so retrofit
-/// and live capture produce consistent labels.
 fn summarize_finding(unified_diff: &str) -> String {
     if let Some(rest) = unified_diff.strip_prefix("=== PANIC ===\n") {
         for line in rest.lines() {
@@ -331,7 +487,9 @@ fn summarize_finding(unified_diff: &str) -> String {
     }
 }
 
-// ---------- Perf-report mode ---------------------------------------------
+// =========================================================================
+// Perf-report mode (HEAD vs BASE wall-clock, existing)
+// =========================================================================
 
 #[derive(Default, Debug)]
 struct PerfStats {
@@ -343,28 +501,14 @@ struct PerfStats {
     ops_diverged: u64,
     ops_panicked: u64,
     ops_errored: u64,
-    /// Per-op (head_micros, base_micros) for ops where both sides
-    /// returned a plan. Order randomised per-op to dampen warm-cache
-    /// bias toward whichever side runs first.
     samples: Vec<(u128, u128)>,
-    /// Per-op (head_fetch_count, base_fetch_count, head_bytes, base_bytes)
-    /// for the same set of ops.
     shapes: Vec<(usize, usize, usize, usize)>,
 }
 
-fn run_perf_mode(
-    args: Args,
-    cfg: CommonConfig,
-    opts: CommonOptions,
-    gen_cfg: GenConfig,
-    op_cfg: OpGenConfig,
-) {
+fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: GenConfig, op_cfg: OpGenConfig) {
     let mut stats = PerfStats::default();
     let mut state = args.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
 
-    // Both planners are built ONCE per schema (the expensive setup —
-    // parsing the supergraph, building internal indexes — should not
-    // be inside the per-op timing loop).
     struct Planners {
         head: HeadPlanner,
         base: BasePlanner,
@@ -397,7 +541,6 @@ fn run_perf_mode(
                 }
                 _ => continue,
             };
-            // Build both planners; bail this schema if either fails.
             let head = match HeadPlanner::build(&supergraph_sdl, &cfg) {
                 Ok(p) => p,
                 Err(_) => continue,
@@ -430,7 +573,6 @@ fn run_perf_mode(
             }
         };
 
-        // Randomise head/base order to dampen first-run warm-cache bias.
         let head_first = (next_bytes(&mut state, 1)[0] & 1) == 0;
         let plan_h = || {
             let t = Instant::now();
@@ -466,17 +608,17 @@ fn run_perf_mode(
             }
         };
 
-        // Plans should match for perf comparison to be meaningful.
-        // Reuse the diff layer's normalisation to avoid spurious
-        // mismatches from version-drift wire format. Cheap; runs after
-        // timing so it doesn't pollute measurements.
         if !plans_equivalent(&head_plan, &base_plan) {
             stats.ops_diverged += 1;
             continue;
         }
 
-        let h_bytes = serde_json::to_string(&head_plan).map(|s| s.len()).unwrap_or(0);
-        let b_bytes = serde_json::to_string(&base_plan).map(|s| s.len()).unwrap_or(0);
+        let h_bytes = serde_json::to_string(&head_plan)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let b_bytes = serde_json::to_string(&base_plan)
+            .map(|s| s.len())
+            .unwrap_or(0);
         let h_fetch = count_fetch_nodes(&head_plan);
         let b_fetch = count_fetch_nodes(&base_plan);
 
@@ -494,11 +636,6 @@ fn run_perf_mode(
     print_perf_report(&stats);
 }
 
-/// Compares plans through the same normaliser the correctness-mode
-/// diff layer uses, so version-format drift (e.g. older versions
-/// serialising `requires:` as raw SDL strings, planner statistics that
-/// don't exist in older versions, null-vs-absent option fields)
-/// doesn't artificially exclude ops from the perf sample.
 fn plans_equivalent(a: &Value, b: &Value) -> bool {
     normalize_plan(a) == normalize_plan(b)
 }
@@ -528,6 +665,14 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+fn percentile_f64(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
 fn print_perf_report(stats: &PerfStats) {
     println!("=== PERF REPORT ===");
     println!(
@@ -545,7 +690,7 @@ fn print_perf_report(stats: &PerfStats) {
     );
 
     if stats.samples.is_empty() {
-        println!("(no perf samples — perf comparison requires at least one op where both planners produced byte-equal JSON)");
+        println!("(no perf samples)");
         return;
     }
 
@@ -554,20 +699,12 @@ fn print_perf_report(stats: &PerfStats) {
     head_us.sort();
     base_us.sort();
 
-    // Ratios: head/base, expressed as f64. Sort separately for percentiles.
     let mut ratios: Vec<f64> = stats
         .samples
         .iter()
         .map(|(h, b)| *h as f64 / (*b).max(1) as f64)
         .collect();
     ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let ratio_pct = |p: f64| -> f64 {
-        if ratios.is_empty() {
-            return f64::NAN;
-        }
-        let idx = ((ratios.len() - 1) as f64 * p).round() as usize;
-        ratios[idx.min(ratios.len() - 1)]
-    };
 
     println!();
     println!("plan() wall-clock micros:");
@@ -593,25 +730,23 @@ fn print_perf_report(stats: &PerfStats) {
     println!(
         "  min={:.2} p50={:.2} p95={:.2} p99={:.2} max={:.2}",
         ratios[0],
-        ratio_pct(0.5),
-        ratio_pct(0.95),
-        ratio_pct(0.99),
+        percentile_f64(&ratios, 0.5),
+        percentile_f64(&ratios, 0.95),
+        percentile_f64(&ratios, 0.99),
         ratios[ratios.len() - 1]
     );
-    let median = ratio_pct(0.5);
+    let median = percentile_f64(&ratios, 0.5);
     println!(
         "  verdict (median ratio): {}",
         if median < 0.95 {
-            format!("HEAD faster (median {:.2}x base)", median)
+            format!("HEAD faster (median {median:.2}x base)")
         } else if median > 1.05 {
-            format!("HEAD slower (median {:.2}x base)", median)
+            format!("HEAD slower (median {median:.2}x base)")
         } else {
-            format!("within ±5% (median {:.2}x base) — likely noise", median)
+            format!("within +/-5% (median {median:.2}x base) -- likely noise")
         }
     );
 
-    // Plan-shape stats are noise-free; useful as a sanity check on the
-    // perf signal ("is HEAD measurably faster because plans got smaller?").
     let mut h_fetch: Vec<usize> = stats.shapes.iter().map(|s| s.0).collect();
     let mut b_fetch: Vec<usize> = stats.shapes.iter().map(|s| s.1).collect();
     let mut h_bytes: Vec<usize> = stats.shapes.iter().map(|s| s.2).collect();
@@ -634,4 +769,626 @@ fn print_perf_report(stats: &PerfStats) {
         median_usize(&h_bytes),
         median_usize(&b_bytes)
     );
+}
+
+// =========================================================================
+// Warm-cache report mode (HEAD-only: cold vs warm measurement)
+// =========================================================================
+
+struct WarmSample {
+    cold_us: u128,
+    cold_alloc_bytes: u64,
+    cold_alloc_count: u64,
+    warm_us: Vec<u128>,
+    warm_alloc_bytes: Vec<u64>,
+    warm_alloc_count: Vec<u64>,
+    cache_entries_after: usize,
+    fetch_count: usize,
+}
+
+fn run_warm_mode(
+    args: Args,
+    cfg: CommonConfig,
+    opts: CommonOptions,
+    gen_cfg: GenConfig,
+    op_cfg: OpGenConfig,
+) {
+    let mut state = args.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut samples: Vec<WarmSample> = Vec::new();
+    let mut schemas_attempted: u64 = 0;
+    let mut schemas_composed: u64 = 0;
+    let mut schemas_built: u64 = 0;
+    let mut ops_attempted: u64 = 0;
+    let mut ops_skipped: u64 = 0;
+    let mut ops_errored: u64 = 0;
+
+    let mut current_planner: Option<HeadPlanner> = None;
+    let mut current_supergraph: Option<String> = None;
+    let mut ops_done_for_schema: u64 = 0;
+
+    for i in 0..args.iterations {
+        let need_new_schema = args.smoke_fixture && current_planner.is_none()
+            || (!args.smoke_fixture
+                && (current_planner.is_none() || ops_done_for_schema >= args.ops_per_schema));
+
+        if need_new_schema {
+            let bytes = next_bytes(&mut state, 4096);
+            let subgraphs = if args.smoke_fixture {
+                smoke_test_fixture()
+            } else {
+                let mut u = Unstructured::new(&bytes);
+                match generate_federated_subgraphs(&mut u, &gen_cfg) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                }
+            };
+            schemas_attempted += 1;
+            let supergraph_sdl = match try_compose(&subgraphs) {
+                ComposeOutcome::Composed { supergraph_sdl } => {
+                    schemas_composed += 1;
+                    supergraph_sdl
+                }
+                _ => continue,
+            };
+            let planner = match HeadPlanner::build(&supergraph_sdl, &cfg) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            schemas_built += 1;
+            current_planner = Some(planner);
+            current_supergraph = Some(supergraph_sdl);
+            ops_done_for_schema = 0;
+        }
+
+        let Some(planner) = current_planner.as_ref() else {
+            continue;
+        };
+        let Some(supergraph_sdl) = current_supergraph.as_ref() else {
+            continue;
+        };
+
+        let op_bytes = next_bytes(&mut state, 1024);
+        ops_attempted += 1;
+        let op_text = match generate_operation_with_config(supergraph_sdl, &op_bytes, &op_cfg) {
+            Ok(op) => op,
+            Err(_) => {
+                ops_skipped += 1;
+                ops_done_for_schema += 1;
+                continue;
+            }
+        };
+
+        // Cold plan (1st call)
+        alloc_start_tracking();
+        let cold_start = Instant::now();
+        let cold_result =
+            catch_unwind(AssertUnwindSafe(|| planner.plan(&op_text, None, &opts)));
+        let cold_us = cold_start.elapsed().as_micros();
+        let cold_alloc = alloc_stop_tracking();
+
+        let cold_plan = match cold_result {
+            Ok(Ok(p)) => p,
+            _ => {
+                ops_errored += 1;
+                ops_done_for_schema += 1;
+                continue;
+            }
+        };
+
+        // Warm plans (repeats 2..N)
+        let mut warm_us = Vec::with_capacity(args.warm_repeats);
+        let mut warm_alloc_bytes = Vec::with_capacity(args.warm_repeats);
+        let mut warm_alloc_count = Vec::with_capacity(args.warm_repeats);
+        let mut all_match = true;
+
+        for _ in 0..args.warm_repeats {
+            alloc_start_tracking();
+            let start = Instant::now();
+            let result =
+                catch_unwind(AssertUnwindSafe(|| planner.plan(&op_text, None, &opts)));
+            let us = start.elapsed().as_micros();
+            let alloc = alloc_stop_tracking();
+
+            match result {
+                Ok(Ok(ref p)) => {
+                    if normalize_plan(&cold_plan) != normalize_plan(p) {
+                        all_match = false;
+                    }
+                    warm_us.push(us);
+                    warm_alloc_bytes.push(alloc.bytes);
+                    warm_alloc_count.push(alloc.count);
+                }
+                _ => {
+                    ops_errored += 1;
+                    break;
+                }
+            }
+        }
+
+        if !all_match {
+            eprintln!("[{i}] WARNING: warm replay produced different plan!");
+        }
+
+        let cache_entries = planner.condition_resolver_cache_len();
+        let fetch_count = count_fetch_nodes(&cold_plan);
+
+        if args.verbose {
+            let warm_median = if warm_us.is_empty() {
+                0
+            } else {
+                let mut sorted = warm_us.clone();
+                sorted.sort();
+                sorted[sorted.len() / 2]
+            };
+            let speedup = if warm_median > 0 {
+                cold_us as f64 / warm_median as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[{i}] cold={cold_us}us warm_median={warm_median}us speedup={speedup:.1}x \
+                 cache={cache_entries} fetches={fetch_count} \
+                 cold_alloc={}KB warm_alloc={}KB",
+                cold_alloc.bytes / 1024,
+                warm_alloc_bytes.first().unwrap_or(&0) / 1024,
+            );
+        }
+
+        samples.push(WarmSample {
+            cold_us,
+            cold_alloc_bytes: cold_alloc.bytes,
+            cold_alloc_count: cold_alloc.count,
+            warm_us,
+            warm_alloc_bytes,
+            warm_alloc_count,
+            cache_entries_after: cache_entries,
+            fetch_count,
+        });
+
+        ops_done_for_schema += 1;
+    }
+
+    print_warm_report(
+        &samples,
+        schemas_attempted,
+        schemas_composed,
+        schemas_built,
+        ops_attempted,
+        ops_skipped,
+        ops_errored,
+    );
+}
+
+fn print_warm_report(
+    samples: &[WarmSample],
+    schemas_attempted: u64,
+    schemas_composed: u64,
+    schemas_built: u64,
+    ops_attempted: u64,
+    ops_skipped: u64,
+    ops_errored: u64,
+) {
+    println!("=== WARM-CACHE REPORT ===");
+    println!(
+        "schemas: attempted={schemas_attempted} composed={schemas_composed} built={schemas_built}"
+    );
+    println!(
+        "ops:     attempted={ops_attempted} skipped={ops_skipped} errored={ops_errored} sampled={}",
+        samples.len()
+    );
+
+    if samples.is_empty() {
+        println!("(no samples)");
+        return;
+    }
+
+    // Cold timing
+    let mut cold_us: Vec<u128> = samples.iter().map(|s| s.cold_us).collect();
+    cold_us.sort();
+
+    // Warm timing: use median of each sample's warm repeats
+    let mut warm_median_us: Vec<u128> = samples
+        .iter()
+        .filter_map(|s| {
+            if s.warm_us.is_empty() {
+                return None;
+            }
+            let mut sorted = s.warm_us.clone();
+            sorted.sort();
+            Some(sorted[sorted.len() / 2])
+        })
+        .collect();
+    warm_median_us.sort();
+
+    // Speedup ratios: cold / warm_median
+    let mut speedups: Vec<f64> = samples
+        .iter()
+        .filter_map(|s| {
+            if s.warm_us.is_empty() {
+                return None;
+            }
+            let mut sorted = s.warm_us.clone();
+            sorted.sort();
+            let warm_med = sorted[sorted.len() / 2];
+            if warm_med == 0 {
+                return None;
+            }
+            Some(s.cold_us as f64 / warm_med as f64)
+        })
+        .collect();
+    speedups.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!();
+    println!("plan() wall-clock micros:");
+    println!(
+        "  cold:        min={:>6} p50={:>7} p95={:>8} max={:>9}",
+        cold_us[0],
+        percentile(&cold_us, 0.5),
+        percentile(&cold_us, 0.95),
+        cold_us[cold_us.len() - 1]
+    );
+    if !warm_median_us.is_empty() {
+        println!(
+            "  warm(median): min={:>6} p50={:>7} p95={:>8} max={:>9}",
+            warm_median_us[0],
+            percentile(&warm_median_us, 0.5),
+            percentile(&warm_median_us, 0.95),
+            warm_median_us[warm_median_us.len() - 1]
+        );
+    }
+
+    if !speedups.is_empty() {
+        println!();
+        println!("cold/warm speedup ratio:");
+        println!(
+            "  min={:.2}x p50={:.2}x p95={:.2}x max={:.2}x",
+            speedups[0],
+            percentile_f64(&speedups, 0.5),
+            percentile_f64(&speedups, 0.95),
+            speedups[speedups.len() - 1]
+        );
+    }
+
+    // Allocation stats
+    let mut cold_alloc_kb: Vec<u64> = samples.iter().map(|s| s.cold_alloc_bytes / 1024).collect();
+    cold_alloc_kb.sort();
+    let mut warm_alloc_kb: Vec<u64> = samples
+        .iter()
+        .filter_map(|s| s.warm_alloc_bytes.first().copied())
+        .map(|b| b / 1024)
+        .collect();
+    warm_alloc_kb.sort();
+
+    let mut alloc_savings: Vec<f64> = samples
+        .iter()
+        .filter_map(|s| {
+            let warm_b = *s.warm_alloc_bytes.first()?;
+            if s.cold_alloc_bytes == 0 {
+                return None;
+            }
+            Some(1.0 - (warm_b as f64 / s.cold_alloc_bytes as f64))
+        })
+        .collect();
+    alloc_savings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!();
+    println!("allocations (KB):");
+    println!(
+        "  cold:  min={:>6} p50={:>7} p95={:>8} max={:>9}",
+        cold_alloc_kb[0],
+        percentile_u64(&cold_alloc_kb, 0.5),
+        percentile_u64(&cold_alloc_kb, 0.95),
+        cold_alloc_kb[cold_alloc_kb.len() - 1]
+    );
+    if !warm_alloc_kb.is_empty() {
+        println!(
+            "  warm:  min={:>6} p50={:>7} p95={:>8} max={:>9}",
+            warm_alloc_kb[0],
+            percentile_u64(&warm_alloc_kb, 0.5),
+            percentile_u64(&warm_alloc_kb, 0.95),
+            warm_alloc_kb[warm_alloc_kb.len() - 1]
+        );
+    }
+    if !alloc_savings.is_empty() {
+        println!(
+            "  warm savings: p50={:.0}% p95={:.0}%",
+            percentile_f64(&alloc_savings, 0.5) * 100.0,
+            percentile_f64(&alloc_savings, 0.95) * 100.0,
+        );
+    }
+
+    // Cache stats
+    let mut cache_entries: Vec<usize> = samples.iter().map(|s| s.cache_entries_after).collect();
+    cache_entries.sort();
+    let max_cache = *cache_entries.last().unwrap_or(&0);
+    let with_cache = cache_entries.iter().filter(|&&c| c > 0).count();
+
+    println!();
+    println!("condition cache:");
+    println!(
+        "  ops with cache entries: {}/{} ({:.0}%)",
+        with_cache,
+        samples.len(),
+        with_cache as f64 / samples.len() as f64 * 100.0
+    );
+    println!("  max entries: {max_cache}");
+
+    // Fetch count distribution
+    let mut fetches: Vec<usize> = samples.iter().map(|s| s.fetch_count).collect();
+    fetches.sort();
+    println!();
+    println!("plan complexity:");
+    println!(
+        "  fetch nodes: min={} p50={} p95={} max={}",
+        fetches[0],
+        fetches[fetches.len() / 2],
+        fetches[(fetches.len() as f64 * 0.95) as usize],
+        fetches[fetches.len() - 1]
+    );
+}
+
+fn percentile_u64(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+// =========================================================================
+// Carryover correctness mode (HEAD-only: V1 -> V2 with cache)
+// =========================================================================
+
+fn run_carryover_mode(
+    args: Args,
+    cfg: CommonConfig,
+    opts: CommonOptions,
+    gen_cfg: GenConfig,
+    op_cfg: OpGenConfig,
+) {
+    let mut state = args.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut schemas_attempted: u64 = 0;
+    let mut schemas_composed: u64 = 0;
+    let mut schemas_tested: u64 = 0;
+    let mut ops_tested: u64 = 0;
+    let mut ops_skipped: u64 = 0;
+    let mut mismatches: u64 = 0;
+    let mut cache_entries_total: u64 = 0;
+
+    for _schema_round in 0.. {
+        if ops_tested + ops_skipped >= args.iterations {
+            break;
+        }
+
+        // Generate schema
+        let bytes = next_bytes(&mut state, 4096);
+        let subgraphs = if args.smoke_fixture {
+            smoke_test_fixture()
+        } else {
+            let mut u = Unstructured::new(&bytes);
+            match generate_federated_subgraphs(&mut u, &gen_cfg) {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
+        };
+        schemas_attempted += 1;
+
+        let supergraph_sdl = match try_compose(&subgraphs) {
+            ComposeOutcome::Composed { supergraph_sdl } => {
+                schemas_composed += 1;
+                supergraph_sdl
+            }
+            _ => continue,
+        };
+
+        // Build V1 planner
+        let planner_v1 = match HeadPlanner::build(&supergraph_sdl, &cfg) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Generate and plan ops through V1 to populate cache
+        let mut v1_plans: Vec<(String, Value)> = Vec::new();
+        for _ in 0..args.ops_per_schema {
+            let op_bytes = next_bytes(&mut state, 1024);
+            let op_text = match generate_operation_with_config(&supergraph_sdl, &op_bytes, &op_cfg)
+            {
+                Ok(op) => op,
+                Err(_) => {
+                    ops_skipped += 1;
+                    continue;
+                }
+            };
+            match planner_v1.plan(&op_text, None, &opts) {
+                Ok(plan) => v1_plans.push((op_text, plan)),
+                Err(_) => {
+                    ops_skipped += 1;
+                }
+            }
+        }
+
+        if v1_plans.is_empty() {
+            continue;
+        }
+
+        let v1_cache_len = planner_v1.condition_resolver_cache_len();
+        cache_entries_total += v1_cache_len as u64;
+
+        // Determine the V2 schema (same or mutated)
+        let v2_sdl = if args.mutate_schema {
+            match mutate_supergraph_add_field(&supergraph_sdl) {
+                Some(s) => s,
+                None => supergraph_sdl.clone(), // Fall back to same schema
+            }
+        } else {
+            supergraph_sdl.clone()
+        };
+
+        // Build V2-fresh (no carryover) — the reference
+        let planner_v2_fresh = match HeadPlanner::build(&v2_sdl, &cfg) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Build V2-carryover (with V1's cache)
+        let planner_v2_carryover = match HeadPlanner::build_with_previous_cache(
+            &v2_sdl,
+            &cfg,
+            planner_v1.condition_resolver_cache(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                if args.verbose {
+                    eprintln!("V2-carryover build failed: {e}");
+                }
+                continue;
+            }
+        };
+
+        schemas_tested += 1;
+
+        // Re-plan all ops through both V2 planners and compare
+        for (op_text, _v1_plan) in &v1_plans {
+            let fresh_plan = match planner_v2_fresh.plan(op_text, None, &opts) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let carryover_plan = match planner_v2_carryover.plan(op_text, None, &opts) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("CARRYOVER PLAN FAILED: {e}\n  op: {op_text}");
+                    mismatches += 1;
+                    ops_tested += 1;
+                    continue;
+                }
+            };
+
+            if normalize_plan(&fresh_plan) != normalize_plan(&carryover_plan) {
+                mismatches += 1;
+                eprintln!(
+                    "CARRYOVER MISMATCH (schema_round={_schema_round} cache_len={v1_cache_len} mutated={}):",
+                    args.mutate_schema
+                );
+                eprintln!("  op: {op_text}");
+                // Print a short diff
+                let fresh_str = serde_json::to_string_pretty(&fresh_plan).unwrap_or_default();
+                let carryover_str =
+                    serde_json::to_string_pretty(&carryover_plan).unwrap_or_default();
+                for change in similar::TextDiff::from_lines(&fresh_str, &carryover_str)
+                    .iter_all_changes()
+                {
+                    let sign = match change.tag() {
+                        similar::ChangeTag::Delete => "-",
+                        similar::ChangeTag::Insert => "+",
+                        similar::ChangeTag::Equal => continue,
+                    };
+                    eprint!("  {sign}{change}");
+                }
+                eprintln!();
+            }
+
+            ops_tested += 1;
+        }
+
+        if args.verbose {
+            eprintln!(
+                "[schema {_schema_round}] subgraphs={} v1_cache={v1_cache_len} ops={} mutated={}",
+                subgraphs.len(),
+                v1_plans.len(),
+                args.mutate_schema
+            );
+        }
+    }
+
+    println!("=== CARRYOVER CORRECTNESS REPORT ===");
+    println!(
+        "schemas: attempted={schemas_attempted} composed={schemas_composed} tested={schemas_tested}"
+    );
+    println!(
+        "ops:     tested={ops_tested} skipped={ops_skipped} mismatches={mismatches}"
+    );
+    println!("cache:   total entries imported={cache_entries_total}");
+    println!("schema mutation: {}", if args.mutate_schema { "enabled" } else { "disabled" });
+    println!();
+
+    if mismatches > 0 {
+        println!("FAIL: {mismatches} carryover mismatches found");
+        std::process::exit(1);
+    } else {
+        println!("PASS: all carryover plans match fresh plans");
+    }
+}
+
+/// Mutate a supergraph SDL by adding a new leaf field to the first non-root
+/// object type that has a @join__type directive. Returns None if no suitable
+/// type can be found.
+fn mutate_supergraph_add_field(schema_sdl: &str) -> Option<String> {
+    // Extract first join__Graph enum value
+    let graph_enum_value = {
+        let mut in_enum = false;
+        let mut found = None;
+        for line in schema_sdl.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("enum join__Graph") {
+                in_enum = true;
+                continue;
+            }
+            if in_enum {
+                if trimmed == "}" {
+                    break;
+                }
+                if trimmed.contains("@join__graph(") {
+                    if let Some(name) = trimmed.split_whitespace().next() {
+                        found = Some(name.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        found?
+    };
+
+    let mut result = String::with_capacity(schema_sdl.len() + 200);
+    let mut inserted = false;
+    let mut in_eligible_type = false;
+    let mut brace_depth = 0u32;
+
+    for line in schema_sdl.lines() {
+        let trimmed = line.trim();
+
+        if !inserted
+            && trimmed.starts_with("type ")
+            && !trimmed.starts_with("type Query")
+            && !trimmed.starts_with("type Mutation")
+            && !trimmed.starts_with("type Subscription")
+        {
+            if trimmed.contains("@join__type") {
+                in_eligible_type = true;
+                brace_depth = 0;
+            }
+        }
+
+        if in_eligible_type {
+            brace_depth += trimmed.matches('{').count() as u32;
+            brace_depth = brace_depth.saturating_sub(trimmed.matches('}').count() as u32);
+
+            if brace_depth == 0 && trimmed.contains('}') && !inserted {
+                result.push_str(&format!(
+                    "  _carryoverTestField: String @join__field(graph: {})\n",
+                    graph_enum_value
+                ));
+                inserted = true;
+                in_eligible_type = false;
+            }
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    if inserted {
+        Some(result)
+    } else {
+        None
+    }
 }

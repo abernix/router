@@ -4,7 +4,7 @@
 //! Composition is run only on the HEAD side. The resulting supergraph SDL is
 //! the contract handed to both planners; we don't need to compose twice.
 
-use apollo_federation::composition::{CompositionOptions, compose};
+use apollo_federation::composition::compose;
 use apollo_federation::error::CompositionError;
 use apollo_federation::subgraph::typestate::{Initial, Subgraph};
 
@@ -29,7 +29,7 @@ pub fn try_compose(subgraphs: &[SubgraphSdl]) -> ComposeOutcome {
     for s in subgraphs {
         let url = format!("http://{}", s.name);
         match Subgraph::parse(&s.name, &url, &s.sdl) {
-            Ok(sg) => match sg.into_fed2_test_subgraph(true) {
+            Ok(sg) => match sg.into_fed2_test_subgraph(true, false) {
                 Ok(fed2) => parsed.push(fed2),
                 Err(e) => parse_errors.push(format!("{}: {}", s.name, e)),
             },
@@ -41,7 +41,7 @@ pub fn try_compose(subgraphs: &[SubgraphSdl]) -> ComposeOutcome {
         return ComposeOutcome::ParseFailed { errors: parse_errors };
     }
 
-    match compose(parsed, CompositionOptions::default()) {
+    match compose(parsed) {
         Ok(supergraph) => {
             let supergraph_sdl = supergraph.schema().schema().to_string();
             ComposeOutcome::Composed { supergraph_sdl }

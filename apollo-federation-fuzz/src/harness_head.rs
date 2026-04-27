@@ -15,12 +15,78 @@ use apollo_federation::query_plan::query_planner::QueryPlanner;
 use apollo_federation::query_plan::query_planner::QueryPlannerConfig;
 use apollo_federation::query_plan::query_planner::QueryPlannerDebugConfig;
 
+use apollo_federation::query_graph::SharedConditionResolverCache;
+
 use crate::harness::{CommonConfig, CommonOptions, HarnessError, PlannerHarness};
 
 const VERSION: &str = "head";
 
 pub struct HeadPlanner {
+    supergraph: Supergraph,
+    config: QueryPlannerConfig,
     inner: QueryPlanner,
+}
+
+impl HeadPlanner {
+    /// Returns a reference to the shared condition resolver cache for cache carryover.
+    pub fn condition_resolver_cache(&self) -> &SharedConditionResolverCache {
+        self.inner.condition_resolver_cache()
+    }
+
+    /// Returns the number of entries in the condition resolver cache.
+    pub fn condition_resolver_cache_len(&self) -> usize {
+        self.inner.condition_resolver_cache_len()
+    }
+
+    /// Build a new planner for the given schema, carrying over the condition
+    /// resolver cache from a previous planner.
+    pub fn build_with_previous_cache(
+        supergraph_sdl: &str,
+        cfg: &CommonConfig,
+        previous_cache: &SharedConditionResolverCache,
+    ) -> Result<Self, HarnessError> {
+        let supergraph =
+            Supergraph::new_with_router_specs(supergraph_sdl).map_err(|e| HarnessError::Supergraph {
+                version: VERSION,
+                detail: e.to_string(),
+            })?;
+
+        let planner_cfg = Self::make_config(cfg);
+
+        let inner = QueryPlanner::new_with_previous_cache(
+            &supergraph,
+            planner_cfg.clone(),
+            Some(previous_cache),
+        )
+        .map_err(|e| HarnessError::Construct {
+            version: VERSION,
+            detail: e.to_string(),
+        })?;
+
+        Ok(Self {
+            supergraph,
+            config: planner_cfg,
+            inner,
+        })
+    }
+
+    fn make_config(cfg: &CommonConfig) -> QueryPlannerConfig {
+        let max_evaluated_plans =
+            NonZeroU32::new(cfg.max_evaluated_plans.max(1)).unwrap_or(NonZeroU32::new(1).unwrap());
+
+        QueryPlannerConfig {
+            generate_query_fragments: cfg.generate_query_fragments,
+            subgraph_graphql_validation: cfg.subgraph_validation,
+            incremental_delivery: QueryPlanIncrementalDeliveryConfig {
+                enable_defer: cfg.incremental_delivery,
+            },
+            debug: QueryPlannerDebugConfig {
+                max_evaluated_plans,
+                paths_limit: None,
+            },
+            type_conditioned_fetching: cfg.type_conditioned_fetching,
+        }
+    }
 }
 
 impl PlannerHarness for HeadPlanner {
@@ -35,29 +101,20 @@ impl PlannerHarness for HeadPlanner {
                 detail: e.to_string(),
             })?;
 
-        let max_evaluated_plans =
-            NonZeroU32::new(cfg.max_evaluated_plans.max(1)).unwrap_or(NonZeroU32::new(1).unwrap());
+        let planner_cfg = Self::make_config(cfg);
 
-        let planner_cfg = QueryPlannerConfig {
-            generate_query_fragments: cfg.generate_query_fragments,
-            subgraph_graphql_validation: cfg.subgraph_validation,
-            incremental_delivery: QueryPlanIncrementalDeliveryConfig {
-                enable_defer: cfg.incremental_delivery,
-            },
-            debug: QueryPlannerDebugConfig {
-                max_evaluated_plans,
-                paths_limit: None,
-            },
-            type_conditioned_fetching: cfg.type_conditioned_fetching,
-        };
-
-        let inner =
-            QueryPlanner::new(&supergraph, planner_cfg).map_err(|e| HarnessError::Construct {
+        let inner = QueryPlanner::new(&supergraph, planner_cfg.clone()).map_err(|e| {
+            HarnessError::Construct {
                 version: VERSION,
                 detail: e.to_string(),
-            })?;
+            }
+        })?;
 
-        Ok(Self { inner })
+        Ok(Self {
+            supergraph,
+            config: planner_cfg,
+            inner,
+        })
     }
 
     fn plan(
