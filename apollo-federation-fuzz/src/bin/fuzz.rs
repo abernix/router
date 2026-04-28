@@ -30,6 +30,7 @@ use apollo_federation_fuzz::compose::{ComposeOutcome, try_compose};
 use apollo_federation_fuzz::diff::{normalize as normalize_plan, run_diff, DiffOutcome};
 use apollo_federation_fuzz::harness::{CommonConfig, CommonOptions, PlannerHarness};
 use apollo_federation_fuzz::op_gen::{generate_operation_with_config, OpGenConfig};
+use apollo_federation_fuzz::preset_schemas::{PresetConfig, PresetSchema};
 use apollo_federation_fuzz::subgraph_gen::{
     generate_federated_subgraphs, smoke_test_fixture, GenConfig, SubgraphSdl,
 };
@@ -95,6 +96,16 @@ fn alloc_reset() {
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum PresetKind {
+    /// Wide fan-out: N departments all extending Product with @requires.
+    Wide,
+    /// Deep chain: N subgraphs forming a linked list with crosscut @requires.
+    Deep,
+    /// Mesh: N subgraphs extending multiple core entities with cross-@requires.
+    Mesh,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum ReportMode {
@@ -196,6 +207,17 @@ struct Args {
     /// When false, V2 uses the identical schema — tests same-schema carryover.
     #[arg(long, default_value_t = false)]
     mutate_schema: bool,
+
+    // --- Preset schema mode ---
+
+    /// Use a deterministic pathological schema preset instead of random
+    /// generation. Overrides --smoke-fixture and schema complexity knobs.
+    #[arg(long, value_enum)]
+    preset: Option<PresetKind>,
+
+    /// Number of extension subgraphs in preset schemas (default 50).
+    #[arg(long, default_value_t = 50)]
+    num_extensions: usize,
 }
 
 impl Args {
@@ -232,6 +254,21 @@ impl Args {
             cfg.multiple_key_chance = v;
         }
         cfg
+    }
+
+    fn preset_config(&self) -> PresetConfig {
+        PresetConfig {
+            num_extensions: self.num_extensions,
+        }
+    }
+
+    fn build_preset(&self) -> Option<PresetSchema> {
+        let preset_cfg = self.preset_config();
+        self.preset.map(|kind| match kind {
+            PresetKind::Wide => apollo_federation_fuzz::preset_schemas::wide_fan_out(&preset_cfg),
+            PresetKind::Deep => apollo_federation_fuzz::preset_schemas::deep_chain(&preset_cfg),
+            PresetKind::Mesh => apollo_federation_fuzz::preset_schemas::mesh(&preset_cfg),
+        })
     }
 }
 
@@ -793,6 +830,13 @@ fn run_warm_mode(
     gen_cfg: GenConfig,
     op_cfg: OpGenConfig,
 ) {
+    // Preset path: compose once, use preset stress queries
+    if let Some(preset) = args.build_preset() {
+        run_warm_mode_preset(args, cfg, opts, preset);
+        return;
+    }
+
+    // Random generation path (original)
     let mut state = args.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut samples: Vec<WarmSample> = Vec::new();
     let mut schemas_attempted: u64 = 0;
@@ -858,92 +902,11 @@ fn run_warm_mode(
             }
         };
 
-        // Cold plan (1st call)
-        alloc_start_tracking();
-        let cold_start = Instant::now();
-        let cold_result =
-            catch_unwind(AssertUnwindSafe(|| planner.plan(&op_text, None, &opts)));
-        let cold_us = cold_start.elapsed().as_micros();
-        let cold_alloc = alloc_stop_tracking();
-
-        let cold_plan = match cold_result {
-            Ok(Ok(p)) => p,
-            _ => {
-                ops_errored += 1;
-                ops_done_for_schema += 1;
-                continue;
-            }
-        };
-
-        // Warm plans (repeats 2..N)
-        let mut warm_us = Vec::with_capacity(args.warm_repeats);
-        let mut warm_alloc_bytes = Vec::with_capacity(args.warm_repeats);
-        let mut warm_alloc_count = Vec::with_capacity(args.warm_repeats);
-        let mut all_match = true;
-
-        for _ in 0..args.warm_repeats {
-            alloc_start_tracking();
-            let start = Instant::now();
-            let result =
-                catch_unwind(AssertUnwindSafe(|| planner.plan(&op_text, None, &opts)));
-            let us = start.elapsed().as_micros();
-            let alloc = alloc_stop_tracking();
-
-            match result {
-                Ok(Ok(ref p)) => {
-                    if normalize_plan(&cold_plan) != normalize_plan(p) {
-                        all_match = false;
-                    }
-                    warm_us.push(us);
-                    warm_alloc_bytes.push(alloc.bytes);
-                    warm_alloc_count.push(alloc.count);
-                }
-                _ => {
-                    ops_errored += 1;
-                    break;
-                }
-            }
+        let sample = measure_warm_sample(planner, &op_text, &opts, args.warm_repeats, args.verbose, i);
+        match sample {
+            Some(s) => samples.push(s),
+            None => ops_errored += 1,
         }
-
-        if !all_match {
-            eprintln!("[{i}] WARNING: warm replay produced different plan!");
-        }
-
-        let cache_entries = planner.condition_resolver_cache_len();
-        let fetch_count = count_fetch_nodes(&cold_plan);
-
-        if args.verbose {
-            let warm_median = if warm_us.is_empty() {
-                0
-            } else {
-                let mut sorted = warm_us.clone();
-                sorted.sort();
-                sorted[sorted.len() / 2]
-            };
-            let speedup = if warm_median > 0 {
-                cold_us as f64 / warm_median as f64
-            } else {
-                0.0
-            };
-            eprintln!(
-                "[{i}] cold={cold_us}us warm_median={warm_median}us speedup={speedup:.1}x \
-                 cache={cache_entries} fetches={fetch_count} \
-                 cold_alloc={}KB warm_alloc={}KB",
-                cold_alloc.bytes / 1024,
-                warm_alloc_bytes.first().unwrap_or(&0) / 1024,
-            );
-        }
-
-        samples.push(WarmSample {
-            cold_us,
-            cold_alloc_bytes: cold_alloc.bytes,
-            cold_alloc_count: cold_alloc.count,
-            warm_us,
-            warm_alloc_bytes,
-            warm_alloc_count,
-            cache_entries_after: cache_entries,
-            fetch_count,
-        });
 
         ops_done_for_schema += 1;
     }
@@ -957,6 +920,175 @@ fn run_warm_mode(
         ops_skipped,
         ops_errored,
     );
+}
+
+fn run_warm_mode_preset(
+    args: Args,
+    cfg: CommonConfig,
+    opts: CommonOptions,
+    preset: PresetSchema,
+) {
+    eprintln!(
+        "Composing preset schema ({} subgraphs, {} stress queries)...",
+        preset.subgraphs.len(),
+        preset.stress_queries.len(),
+    );
+
+    let supergraph_sdl = match try_compose(&preset.subgraphs) {
+        ComposeOutcome::Composed { supergraph_sdl } => supergraph_sdl,
+        ComposeOutcome::ParseFailed { errors } => {
+            eprintln!("Preset subgraph parse failed:");
+            for e in &errors {
+                eprintln!("  {e}");
+            }
+            std::process::exit(1);
+        }
+        ComposeOutcome::CompositionFailed { errors } => {
+            eprintln!("Preset composition failed:");
+            for e in &errors {
+                eprintln!("  {e}");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "Composed supergraph: {} bytes. Building planner...",
+        supergraph_sdl.len()
+    );
+
+    let planner = match HeadPlanner::build(&supergraph_sdl, &cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to build planner: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("Planner built. Running {} stress queries x {} warm repeats...",
+        preset.stress_queries.len(), args.warm_repeats);
+
+    let mut samples: Vec<WarmSample> = Vec::new();
+    let mut ops_errored: u64 = 0;
+
+    for (qi, pq) in preset.stress_queries.iter().enumerate() {
+        eprintln!("  query {:>2}: {} ...", qi, pq.name);
+        let sample = measure_warm_sample(
+            &planner,
+            &pq.query,
+            &opts,
+            args.warm_repeats,
+            true, // always verbose for preset mode
+            qi as u64,
+        );
+        match sample {
+            Some(s) => samples.push(s),
+            None => {
+                ops_errored += 1;
+                eprintln!("    ERROR: planning failed for {}", pq.name);
+            }
+        }
+    }
+
+    print_warm_report(
+        &samples,
+        1,
+        1,
+        1,
+        preset.stress_queries.len() as u64,
+        0,
+        ops_errored,
+    );
+}
+
+/// Measure cold-vs-warm planning for a single operation through a planner.
+fn measure_warm_sample(
+    planner: &HeadPlanner,
+    op_text: &str,
+    opts: &CommonOptions,
+    warm_repeats: usize,
+    verbose: bool,
+    idx: u64,
+) -> Option<WarmSample> {
+    // Cold plan (1st call)
+    alloc_start_tracking();
+    let cold_start = Instant::now();
+    let cold_result =
+        catch_unwind(AssertUnwindSafe(|| planner.plan(op_text, None, opts)));
+    let cold_us = cold_start.elapsed().as_micros();
+    let cold_alloc = alloc_stop_tracking();
+
+    let cold_plan = match cold_result {
+        Ok(Ok(p)) => p,
+        _ => return None,
+    };
+
+    // Warm plans (repeats 2..N)
+    let mut warm_us = Vec::with_capacity(warm_repeats);
+    let mut warm_alloc_bytes = Vec::with_capacity(warm_repeats);
+    let mut warm_alloc_count = Vec::with_capacity(warm_repeats);
+    let mut all_match = true;
+
+    for _ in 0..warm_repeats {
+        alloc_start_tracking();
+        let start = Instant::now();
+        let result =
+            catch_unwind(AssertUnwindSafe(|| planner.plan(op_text, None, opts)));
+        let us = start.elapsed().as_micros();
+        let alloc = alloc_stop_tracking();
+
+        match result {
+            Ok(Ok(ref p)) => {
+                if normalize_plan(&cold_plan) != normalize_plan(p) {
+                    all_match = false;
+                }
+                warm_us.push(us);
+                warm_alloc_bytes.push(alloc.bytes);
+                warm_alloc_count.push(alloc.count);
+            }
+            _ => break,
+        }
+    }
+
+    if !all_match {
+        eprintln!("[{idx}] WARNING: warm replay produced different plan!");
+    }
+
+    let cache_entries = planner.condition_resolver_cache_len();
+    let fetch_count = count_fetch_nodes(&cold_plan);
+
+    if verbose {
+        let warm_median = if warm_us.is_empty() {
+            0
+        } else {
+            let mut sorted = warm_us.clone();
+            sorted.sort();
+            sorted[sorted.len() / 2]
+        };
+        let speedup = if warm_median > 0 {
+            cold_us as f64 / warm_median as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "    [{idx}] cold={cold_us}us warm_median={warm_median}us speedup={speedup:.1}x \
+             cache={cache_entries} fetches={fetch_count} \
+             cold_alloc={}KB warm_alloc={}KB",
+            cold_alloc.bytes / 1024,
+            warm_alloc_bytes.first().unwrap_or(&0) / 1024,
+        );
+    }
+
+    Some(WarmSample {
+        cold_us,
+        cold_alloc_bytes: cold_alloc.bytes,
+        cold_alloc_count: cold_alloc.count,
+        warm_us,
+        warm_alloc_bytes,
+        warm_alloc_count,
+        cache_entries_after: cache_entries,
+        fetch_count,
+    })
 }
 
 fn print_warm_report(

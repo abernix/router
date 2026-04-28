@@ -24,6 +24,7 @@ pub mod harness_head;
 pub mod compose;
 pub mod diff;
 pub mod op_gen;
+pub mod preset_schemas;
 pub mod subgraph_gen;
 
 pub use harness::{CommonConfig, CommonOptions, HarnessError, PlannerHarness};
