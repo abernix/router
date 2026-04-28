@@ -42,6 +42,8 @@ sha1.workspace = true
 hex.workspace = true
 thiserror = "2.0"
 clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+getrandom = "0.3"
 
 [dev-dependencies]
 proptest = "1.5"

@@ -18,7 +18,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use arbitrary::Unstructured;
@@ -63,6 +63,25 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
+
+/// Set to true by the SIGINT handler. All loops check this and exit cleanly.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn should_stop() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
+fn install_sigint_handler() {
+    ctrlc::set_handler(move || {
+        if SHUTDOWN.swap(true, Ordering::Relaxed) {
+            // Second Ctrl-C: hard exit
+            eprintln!("\nForced exit.");
+            std::process::exit(130);
+        }
+        eprintln!("\nShutting down (Ctrl-C again to force)...");
+    })
+    .expect("failed to install Ctrl-C handler");
+}
 
 #[derive(Clone, Copy)]
 struct AllocSnapshot {
@@ -130,12 +149,26 @@ enum ReportMode {
 #[derive(Parser, Debug)]
 #[command(about = "Differential fuzz of two apollo-federation query planners")]
 struct Args {
-    /// Total iterations to attempt.
+    /// Total iterations to attempt. Set to 0 for unbounded (run until Ctrl-C).
     #[arg(long, default_value_t = 200)]
     iterations: u64,
-    /// Deterministic seed.
+    /// Deterministic seed. Set to 0 for a fixed seed, or use --random-seed
+    /// for entropy from the OS.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Use a random seed from the OS instead of --seed. The chosen seed
+    /// is printed at startup for reproducibility.
+    #[arg(long, default_value_t = false)]
+    random_seed: bool,
+    /// Abort on the first divergence or panic (exit 1). Default in
+    /// correctness mode is to continue and collect all findings.
+    #[arg(long, default_value_t = false)]
+    fail_fast: bool,
+    /// Print progress stats every N iterations (0 = only at end).
+    /// Default: every 500 iterations in bounded mode, every 100 in
+    /// unbounded mode.
+    #[arg(long)]
+    progress_every: Option<u64>,
     /// How many planner runs to execute against each generated supergraph
     /// before regenerating. Set to 1 to maximize schema variety; raise to
     /// amortize the (relatively expensive) composition step.
@@ -218,6 +251,13 @@ struct Args {
     /// Number of extension subgraphs in preset schemas (default 50).
     #[arg(long, default_value_t = 50)]
     num_extensions: usize,
+
+    /// In preset warm mode, also generate random operations against the
+    /// preset's composed supergraph (in addition to the preset stress
+    /// queries). This combines the preset's large-schema structure with
+    /// random query surface for broader coverage.
+    #[arg(long, default_value_t = false)]
+    random_ops: bool,
 }
 
 impl Args {
@@ -270,6 +310,28 @@ impl Args {
             PresetKind::Mesh => apollo_federation_fuzz::preset_schemas::mesh(&preset_cfg),
         })
     }
+
+    fn effective_seed(&self) -> u64 {
+        if self.random_seed {
+            let mut buf = [0u8; 8];
+            getrandom::fill(&mut buf).expect("failed to get random seed");
+            u64::from_le_bytes(buf)
+        } else {
+            self.seed
+        }
+    }
+
+    fn is_unbounded(&self) -> bool {
+        self.iterations == 0
+    }
+
+    fn should_run(&self, i: u64) -> bool {
+        !should_stop() && (self.is_unbounded() || i < self.iterations)
+    }
+
+    fn progress_interval(&self) -> u64 {
+        self.progress_every.unwrap_or(if self.is_unbounded() { 100 } else { 500 })
+    }
 }
 
 #[derive(Default, Debug)]
@@ -286,7 +348,14 @@ struct Stats {
 }
 
 fn main() {
+    install_sigint_handler();
+
     let args = Args::parse();
+    let seed = args.effective_seed();
+    if args.random_seed {
+        eprintln!("random seed: {seed} (use --seed {seed} to reproduce)");
+    }
+
     let cfg = CommonConfig {
         incremental_delivery: args.enable_defer,
         ..CommonConfig::default()
@@ -300,26 +369,33 @@ fn main() {
 
     match args.report {
         ReportMode::Perf => {
-            run_perf_mode(args, cfg, opts, gen_cfg, op_cfg);
+            run_perf_mode(args, seed, cfg, opts, gen_cfg, op_cfg);
             return;
         }
         ReportMode::Warm => {
-            run_warm_mode(args, cfg, opts, gen_cfg, op_cfg);
+            run_warm_mode(args, seed, cfg, opts, gen_cfg, op_cfg);
             return;
         }
         ReportMode::Carryover => {
-            run_carryover_mode(args, cfg, opts, gen_cfg, op_cfg);
+            run_carryover_mode(args, seed, cfg, opts, gen_cfg, op_cfg);
             return;
         }
         ReportMode::Correctness => {}
     }
 
+    if args.is_unbounded() {
+        eprintln!("Running unbounded correctness fuzz (Ctrl-C to stop)...");
+    }
+
+    let start_time = Instant::now();
+    let progress_interval = args.progress_interval();
     let mut stats = Stats::default();
-    let mut state = args.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut current_schema: Option<(Vec<SubgraphSdl>, String)> = None;
     let mut ops_done_for_schema: u64 = 0;
+    let mut i: u64 = 0;
 
-    for i in 0..args.iterations {
+    while args.should_run(i) {
         let need_new_schema = args.smoke_fixture && current_schema.is_none()
             || (!args.smoke_fixture
                 && (current_schema.is_none() || ops_done_for_schema >= args.ops_per_schema));
@@ -336,6 +412,7 @@ fn main() {
                         if args.verbose {
                             eprintln!("[{i}] gen subgraph err: {e}");
                         }
+                        i += 1;
                         continue;
                     }
                 }
@@ -352,12 +429,14 @@ fn main() {
                     if args.verbose {
                         eprintln!("[{i}] compose failed: {other:?}");
                     }
+                    i += 1;
                     continue;
                 }
             }
         }
 
         let Some((subgraphs, supergraph_sdl)) = current_schema.as_ref() else {
+            i += 1;
             continue;
         };
 
@@ -371,6 +450,7 @@ fn main() {
                 if args.verbose {
                     eprintln!("[{i}] op skip: {e}");
                 }
+                i += 1;
                 continue;
             }
         };
@@ -378,6 +458,7 @@ fn main() {
         let outcome = run_diff::<HeadPlanner, BasePlanner>(supergraph_sdl, &op_text, None, &cfg, &opts);
         ops_done_for_schema += 1;
 
+        let mut is_finding = false;
         match outcome {
             DiffOutcome::Identical { .. } => stats.planned_identical += 1,
             DiffOutcome::Divergent {
@@ -386,10 +467,11 @@ fn main() {
                 base: _,
             } => {
                 stats.planned_divergent += 1;
+                is_finding = true;
                 let id = save_regression(
                     &args.regressions_dir,
                     i,
-                    args.seed,
+                    seed,
                     subgraphs,
                     supergraph_sdl,
                     &op_text,
@@ -413,11 +495,12 @@ fn main() {
                 ..
             } => {
                 stats.panicked += 1;
+                is_finding = true;
                 let summary = format!("head_panic={head_panic:?}\nbase_panic={base_panic:?}\n",);
                 let id = save_regression(
                     &args.regressions_dir,
                     i,
-                    args.seed,
+                    seed,
                     subgraphs,
                     supergraph_sdl,
                     &op_text,
@@ -426,12 +509,69 @@ fn main() {
                 println!("=== PLANNER PANIC iter={i} saved={id} ===\n{summary}");
             }
         }
+
+        if args.fail_fast && is_finding {
+            eprintln!("--fail-fast: aborting after first finding at iter {i}");
+            print_correctness_stats(&stats, seed, &start_time);
+            std::process::exit(1);
+        }
+
+        // Periodic progress
+        i += 1;
+        if progress_interval > 0 && i % progress_interval == 0 {
+            let elapsed = start_time.elapsed();
+            let rate = i as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "[progress] iter={i} elapsed={:.0}s rate={rate:.0}/s schemas={}/{} \
+                 identical={} diverged={} panicked={} errored={}",
+                elapsed.as_secs_f64(),
+                stats.schemas_composed,
+                stats.schemas_attempted,
+                stats.planned_identical,
+                stats.planned_divergent,
+                stats.panicked,
+                stats.planner_errored,
+            );
+        }
     }
 
-    println!("{stats:?}");
+    if should_stop() {
+        eprintln!("Interrupted after {i} iterations.");
+    }
 
-    if stats.planned_divergent > 0 {
+    print_correctness_stats(&stats, seed, &start_time);
+
+    if stats.planned_divergent > 0 || stats.panicked > 0 {
         std::process::exit(1);
+    }
+}
+
+fn print_correctness_stats(stats: &Stats, seed: u64, start_time: &Instant) {
+    let elapsed = start_time.elapsed();
+    println!("=== CORRECTNESS REPORT ===");
+    println!("seed:    {seed}");
+    println!("elapsed: {:.1}s", elapsed.as_secs_f64());
+    println!(
+        "schemas: attempted={} composed={} compose_failed={}",
+        stats.schemas_attempted, stats.schemas_composed, stats.schemas_compose_failed
+    );
+    println!(
+        "ops:     attempted={} skipped={} identical={} diverged={} panicked={} errored={}",
+        stats.ops_attempted,
+        stats.ops_skipped,
+        stats.planned_identical,
+        stats.planned_divergent,
+        stats.panicked,
+        stats.planner_errored,
+    );
+    if elapsed.as_secs() > 0 {
+        let rate = stats.ops_attempted as f64 / elapsed.as_secs_f64();
+        println!("rate:    {rate:.1} ops/s");
+    }
+    if stats.planned_divergent > 0 || stats.panicked > 0 {
+        println!("FAIL: {} divergences, {} panics", stats.planned_divergent, stats.panicked);
+    } else {
+        println!("PASS: all plans identical");
     }
 }
 
@@ -542,9 +682,9 @@ struct PerfStats {
     shapes: Vec<(usize, usize, usize, usize)>,
 }
 
-fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: GenConfig, op_cfg: OpGenConfig) {
+fn run_perf_mode(args: Args, seed: u64, cfg: CommonConfig, opts: CommonOptions, gen_cfg: GenConfig, op_cfg: OpGenConfig) {
     let mut stats = PerfStats::default();
-    let mut state = args.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
 
     struct Planners {
         head: HeadPlanner,
@@ -554,7 +694,8 @@ fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: Ge
     let mut current_supergraph: Option<String> = None;
     let mut ops_done_for_schema: u64 = 0;
 
-    for i in 0..args.iterations {
+    let mut i: u64 = 0;
+    while args.should_run(i) {
         let need_new_schema = args.smoke_fixture && current.is_none()
             || (!args.smoke_fixture
                 && (current.is_none() || ops_done_for_schema >= args.ops_per_schema));
@@ -567,7 +708,7 @@ fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: Ge
                 let mut u = Unstructured::new(&bytes);
                 match generate_federated_subgraphs(&mut u, &gen_cfg) {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(_) => { i += 1; continue; },
                 }
             };
             stats.schemas_attempted += 1;
@@ -576,15 +717,15 @@ fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: Ge
                     stats.schemas_composed += 1;
                     supergraph_sdl
                 }
-                _ => continue,
+                _ => { i += 1; continue; },
             };
             let head = match HeadPlanner::build(&supergraph_sdl, &cfg) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(_) => { i += 1; continue; },
             };
             let base = match BasePlanner::build(&supergraph_sdl, &cfg) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(_) => { i += 1; continue; },
             };
             stats.schemas_built += 1;
             current = Some(Planners { head, base });
@@ -593,9 +734,11 @@ fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: Ge
         }
 
         let Some(planners) = current.as_ref() else {
+            i += 1;
             continue;
         };
         let Some(supergraph_sdl) = current_supergraph.as_ref() else {
+            i += 1;
             continue;
         };
 
@@ -606,6 +749,7 @@ fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: Ge
             Err(_) => {
                 stats.ops_skipped += 1;
                 ops_done_for_schema += 1;
+                i += 1;
                 continue;
             }
         };
@@ -637,16 +781,19 @@ fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: Ge
             (Ok(Ok(h)), Ok(Ok(b))) => (h, b),
             (Err(_), _) | (_, Err(_)) => {
                 stats.ops_panicked += 1;
+                i += 1;
                 continue;
             }
             _ => {
                 stats.ops_errored += 1;
+                i += 1;
                 continue;
             }
         };
 
         if !plans_equivalent(&head_plan, &base_plan) {
             stats.ops_diverged += 1;
+            i += 1;
             continue;
         }
 
@@ -668,6 +815,7 @@ fn run_perf_mode(args: Args, cfg: CommonConfig, opts: CommonOptions, gen_cfg: Ge
                 head_us as f64 / base_us.max(1) as f64
             );
         }
+        i += 1;
     }
 
     print_perf_report(&stats);
@@ -825,6 +973,7 @@ struct WarmSample {
 
 fn run_warm_mode(
     args: Args,
+    seed: u64,
     cfg: CommonConfig,
     opts: CommonOptions,
     gen_cfg: GenConfig,
@@ -832,12 +981,12 @@ fn run_warm_mode(
 ) {
     // Preset path: compose once, use preset stress queries
     if let Some(preset) = args.build_preset() {
-        run_warm_mode_preset(args, cfg, opts, preset);
+        run_warm_mode_preset(args, seed, cfg, opts, preset, op_cfg);
         return;
     }
 
     // Random generation path (original)
-    let mut state = args.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut samples: Vec<WarmSample> = Vec::new();
     let mut schemas_attempted: u64 = 0;
     let mut schemas_composed: u64 = 0;
@@ -850,7 +999,8 @@ fn run_warm_mode(
     let mut current_supergraph: Option<String> = None;
     let mut ops_done_for_schema: u64 = 0;
 
-    for i in 0..args.iterations {
+    let mut i: u64 = 0;
+    while args.should_run(i) {
         let need_new_schema = args.smoke_fixture && current_planner.is_none()
             || (!args.smoke_fixture
                 && (current_planner.is_none() || ops_done_for_schema >= args.ops_per_schema));
@@ -863,7 +1013,7 @@ fn run_warm_mode(
                 let mut u = Unstructured::new(&bytes);
                 match generate_federated_subgraphs(&mut u, &gen_cfg) {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(_) => { i += 1; continue; },
                 }
             };
             schemas_attempted += 1;
@@ -872,11 +1022,11 @@ fn run_warm_mode(
                     schemas_composed += 1;
                     supergraph_sdl
                 }
-                _ => continue,
+                _ => { i += 1; continue; },
             };
             let planner = match HeadPlanner::build(&supergraph_sdl, &cfg) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(_) => { i += 1; continue; },
             };
             schemas_built += 1;
             current_planner = Some(planner);
@@ -885,9 +1035,11 @@ fn run_warm_mode(
         }
 
         let Some(planner) = current_planner.as_ref() else {
+            i += 1;
             continue;
         };
         let Some(supergraph_sdl) = current_supergraph.as_ref() else {
+            i += 1;
             continue;
         };
 
@@ -898,6 +1050,7 @@ fn run_warm_mode(
             Err(_) => {
                 ops_skipped += 1;
                 ops_done_for_schema += 1;
+                i += 1;
                 continue;
             }
         };
@@ -909,6 +1062,7 @@ fn run_warm_mode(
         }
 
         ops_done_for_schema += 1;
+        i += 1;
     }
 
     print_warm_report(
@@ -924,9 +1078,11 @@ fn run_warm_mode(
 
 fn run_warm_mode_preset(
     args: Args,
+    seed: u64,
     cfg: CommonConfig,
     opts: CommonOptions,
     preset: PresetSchema,
+    op_cfg: OpGenConfig,
 ) {
     eprintln!(
         "Composing preset schema ({} subgraphs, {} stress queries)...",
@@ -965,20 +1121,25 @@ fn run_warm_mode_preset(
         }
     };
 
-    eprintln!("Planner built. Running {} stress queries x {} warm repeats...",
-        preset.stress_queries.len(), args.warm_repeats);
-
     let mut samples: Vec<WarmSample> = Vec::new();
     let mut ops_errored: u64 = 0;
+    let mut ops_skipped: u64 = 0;
+    let mut ops_attempted: u64 = 0;
+
+    // Phase 1: preset stress queries
+    eprintln!("Running {} stress queries x {} warm repeats...",
+        preset.stress_queries.len(), args.warm_repeats);
 
     for (qi, pq) in preset.stress_queries.iter().enumerate() {
+        if should_stop() { break; }
         eprintln!("  query {:>2}: {} ...", qi, pq.name);
+        ops_attempted += 1;
         let sample = measure_warm_sample(
             &planner,
             &pq.query,
             &opts,
             args.warm_repeats,
-            true, // always verbose for preset mode
+            true,
             qi as u64,
         );
         match sample {
@@ -990,13 +1151,52 @@ fn run_warm_mode_preset(
         }
     }
 
+    // Phase 2: random operations against the preset's schema (if --random-ops)
+    if args.random_ops && !should_stop() {
+        let random_count = if args.is_unbounded() {
+            u64::MAX
+        } else {
+            args.iterations
+        };
+        eprintln!("Running random ops against preset schema (Ctrl-C to stop)...");
+        let mut state = seed.wrapping_add(0xDEAD_BEEF_CAFE_BABE);
+        let mut ri: u64 = 0;
+        while ri < random_count && !should_stop() {
+            let op_bytes = next_bytes(&mut state, 1024);
+            ops_attempted += 1;
+            let op_text = match generate_operation_with_config(&supergraph_sdl, &op_bytes, &op_cfg)
+            {
+                Ok(op) => op,
+                Err(_) => {
+                    ops_skipped += 1;
+                    ri += 1;
+                    continue;
+                }
+            };
+            let idx = preset.stress_queries.len() as u64 + ri;
+            let sample = measure_warm_sample(
+                &planner,
+                &op_text,
+                &opts,
+                args.warm_repeats,
+                args.verbose,
+                idx,
+            );
+            match sample {
+                Some(s) => samples.push(s),
+                None => ops_errored += 1,
+            }
+            ri += 1;
+        }
+    }
+
     print_warm_report(
         &samples,
         1,
         1,
         1,
-        preset.stress_queries.len() as u64,
-        0,
+        ops_attempted,
+        ops_skipped,
         ops_errored,
     );
 }
@@ -1273,12 +1473,13 @@ fn percentile_u64(sorted: &[u64], p: f64) -> u64 {
 
 fn run_carryover_mode(
     args: Args,
+    seed: u64,
     cfg: CommonConfig,
     opts: CommonOptions,
     gen_cfg: GenConfig,
     op_cfg: OpGenConfig,
 ) {
-    let mut state = args.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut schemas_attempted: u64 = 0;
     let mut schemas_composed: u64 = 0;
     let mut schemas_tested: u64 = 0;
@@ -1288,7 +1489,7 @@ fn run_carryover_mode(
     let mut cache_entries_total: u64 = 0;
 
     for _schema_round in 0.. {
-        if ops_tested + ops_skipped >= args.iterations {
+        if should_stop() || (!args.is_unbounded() && ops_tested + ops_skipped >= args.iterations) {
             break;
         }
 
