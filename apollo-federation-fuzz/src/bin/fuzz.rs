@@ -144,6 +144,12 @@ enum ReportMode {
     /// asserts V2 plans match a fresh V2 (no carryover). Tests that
     /// carried-over cache entries don't corrupt plans.
     Carryover,
+    /// Continuous schema evolution with cache carryover validation.
+    /// Builds V1, plans ops, mutates schema to V2 (carrying over cache),
+    /// plans more ops, mutates to V3 (carrying over again), etc.
+    /// At each version, validates plans match a fresh planner.
+    /// Tests long-lived cache correctness through many schema changes.
+    HotSwap,
 }
 
 #[derive(Parser, Debug)]
@@ -234,12 +240,20 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     warm_repeats: usize,
 
-    // --- Carryover-mode specific ---
+    // --- Carryover/hot-swap mode specific ---
 
     /// In carryover mode, mutate the schema between V1 and V2 (add a field).
     /// When false, V2 uses the identical schema — tests same-schema carryover.
     #[arg(long, default_value_t = false)]
     mutate_schema: bool,
+
+    /// In hot-swap mode, how many schema versions to evolve through (default 10).
+    #[arg(long, default_value_t = 10)]
+    schema_versions: u64,
+
+    /// In hot-swap mode, operations to plan per schema version (default 20).
+    #[arg(long, default_value_t = 20)]
+    ops_per_version: u64,
 
     // --- Preset schema mode ---
 
@@ -372,6 +386,10 @@ fn main() {
         }
         ReportMode::Carryover => {
             run_carryover_mode(args, seed, cfg, opts, gen_cfg, op_cfg);
+            return;
+        }
+        ReportMode::HotSwap => {
+            run_hot_swap_mode(args, seed, cfg, opts, gen_cfg, op_cfg);
             return;
         }
         ReportMode::Correctness => {}
@@ -1471,7 +1489,7 @@ fn run_carryover_mode(
 
         // Determine the V2 schema (same or mutated)
         let v2_sdl = if args.mutate_schema {
-            match mutate_supergraph_add_field(&supergraph_sdl) {
+            match mutate_supergraph_add_field(&supergraph_sdl, 0) {
                 Some(s) => s,
                 None => supergraph_sdl.clone(), // Fall back to same schema
             }
@@ -1574,10 +1592,243 @@ fn run_carryover_mode(
     }
 }
 
+// =========================================================================
+// Hot-swap mode (continuous schema evolution with cache carryover)
+// =========================================================================
+
+fn run_hot_swap_mode(
+    args: Args,
+    seed: u64,
+    cfg: CommonConfig,
+    opts: CommonOptions,
+    gen_cfg: GenConfig,
+    op_cfg: OpGenConfig,
+) {
+    let mut state = seed.wrapping_add(0xB0BA_CAFE_DEAD_BEEF);
+    let start_time = Instant::now();
+    let progress_interval = args.progress_interval();
+
+    let mut total_versions: u64 = 0;
+    let mut total_ops: u64 = 0;
+    let mut total_skipped: u64 = 0;
+    let mut total_mismatches: u64 = 0;
+    let mut total_rounds: u64 = 0;
+    let mut max_cache_entries: usize = 0;
+    let mut mutation_counts = [0u64; 4]; // add_field, rename_field, add_type, identity
+
+    // Outer loop: each round starts from a fresh schema and evolves it
+    while !should_stop() && (args.is_unbounded() || total_rounds < args.iterations) {
+        total_rounds += 1;
+
+        // Generate initial schema (V1)
+        let (_initial_subgraphs, initial_sdl) = if let Some(preset) = args.build_preset() {
+            let sdl = match try_compose(&preset.subgraphs) {
+                ComposeOutcome::Composed { supergraph_sdl } => supergraph_sdl,
+                _ => continue,
+            };
+            (preset.subgraphs, sdl)
+        } else {
+            let bytes = next_bytes(&mut state, 4096);
+            let subgraphs = if args.smoke_fixture {
+                smoke_test_fixture()
+            } else {
+                let mut u = Unstructured::new(&bytes);
+                match generate_federated_subgraphs(&mut u, &gen_cfg) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                }
+            };
+            let sdl = match try_compose(&subgraphs) {
+                ComposeOutcome::Composed { supergraph_sdl } => supergraph_sdl,
+                _ => continue,
+            };
+            (subgraphs, sdl)
+        };
+
+        // Build V1 planner
+        let mut current_planner = match HeadPlanner::build(&initial_sdl, &cfg) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let mut current_sdl = initial_sdl;
+        total_versions += 1;
+
+        // Generate a pool of operations once from V1's API schema.
+        // These operations are replayed after each schema mutation.
+        // Operations that become invalid after a mutation are skipped.
+        let mut op_pool: Vec<String> = Vec::new();
+        for _ in 0..args.ops_per_version {
+            let op_bytes = next_bytes(&mut state, 1024);
+            if let Ok(op) = generate_operation_with_config(&current_sdl, &op_bytes, &op_cfg) {
+                op_pool.push(op);
+            }
+        }
+
+        // Plan all ops through V1 to warm the cache
+        for op in &op_pool {
+            let _ = current_planner.plan(op, None, &opts);
+        }
+
+        // Evolve through schema_versions mutations
+        for version in 1..=args.schema_versions {
+            if should_stop() {
+                break;
+            }
+
+            // Pick a mutation type based on the version number for variety
+            let mutation_kind = (state % 4) as usize;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+
+            let mutated_sdl = match mutation_kind {
+                0 => {
+                    mutation_counts[0] += 1;
+                    mutate_supergraph_add_field(&current_sdl, version)
+                }
+                1 => {
+                    mutation_counts[1] += 1;
+                    mutate_supergraph_rename_field(&current_sdl, version)
+                }
+                2 => {
+                    mutation_counts[2] += 1;
+                    mutate_supergraph_add_type(&current_sdl, version)
+                }
+                _ => {
+                    // Identity mutation — same schema, tests pure carryover
+                    mutation_counts[3] += 1;
+                    Some(current_sdl.clone())
+                }
+            };
+
+            let next_sdl = match mutated_sdl {
+                Some(sdl) => sdl,
+                None => current_sdl.clone(), // fall back to identity
+            };
+
+            // Build fresh planner (reference — no carryover)
+            let planner_fresh = match HeadPlanner::build(&next_sdl, &cfg) {
+                Ok(p) => p,
+                Err(_) => {
+                    // Mutation produced invalid schema; skip this version
+                    continue;
+                }
+            };
+
+            // Build carryover planner (with previous version's cache)
+            let planner_carryover = match HeadPlanner::build_with_previous_cache(
+                &next_sdl,
+                &cfg,
+                current_planner.condition_resolver_cache(),
+            ) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            total_versions += 1;
+
+            // Generate some new operations for this schema version too
+            for _ in 0..5 {
+                let op_bytes = next_bytes(&mut state, 1024);
+                if let Ok(op) = generate_operation_with_config(&next_sdl, &op_bytes, &op_cfg) {
+                    op_pool.push(op);
+                }
+            }
+
+            // Validate: plan each operation through both fresh and carryover
+            for op in &op_pool {
+                total_ops += 1;
+                let fresh_result = planner_fresh.plan(op, None, &opts);
+                let carryover_result = planner_carryover.plan(op, None, &opts);
+
+                match (fresh_result, carryover_result) {
+                    (Ok(fresh_plan), Ok(carryover_plan)) => {
+                        if normalize_plan(&fresh_plan) != normalize_plan(&carryover_plan) {
+                            total_mismatches += 1;
+                            eprintln!(
+                                "HOTSWAP MISMATCH: round={total_rounds} version={version} \
+                                 mutation={mutation_kind} cache={max_cache_entries}"
+                            );
+                            eprintln!("  op: {op}");
+                            let fresh_str =
+                                serde_json::to_string_pretty(&fresh_plan).unwrap_or_default();
+                            let carry_str =
+                                serde_json::to_string_pretty(&carryover_plan).unwrap_or_default();
+                            for change in similar::TextDiff::from_lines(&fresh_str, &carry_str)
+                                .iter_all_changes()
+                            {
+                                let sign = match change.tag() {
+                                    similar::ChangeTag::Delete => "-",
+                                    similar::ChangeTag::Insert => "+",
+                                    similar::ChangeTag::Equal => continue,
+                                };
+                                eprint!("  {sign}{change}");
+                            }
+                            eprintln!();
+                        }
+                    }
+                    (Err(_), Ok(_)) | (Ok(_), Err(_)) => {
+                        // One succeeded and the other failed — this is a mismatch
+                        total_mismatches += 1;
+                        eprintln!(
+                            "HOTSWAP ERROR MISMATCH: round={total_rounds} version={version}"
+                        );
+                    }
+                    (Err(_), Err(_)) => {
+                        // Both failed — op became invalid after mutation, skip
+                        total_skipped += 1;
+                    }
+                }
+            }
+
+            // Track cache growth after planning ops through this version
+            let cache_len = planner_carryover.condition_resolver_cache_len();
+            if cache_len > max_cache_entries {
+                max_cache_entries = cache_len;
+            }
+
+            // The carryover planner becomes the current planner for the next version
+            current_planner = planner_carryover;
+            current_sdl = next_sdl;
+
+            if progress_interval > 0 && total_versions % progress_interval == 0 {
+                let elapsed = start_time.elapsed();
+                eprintln!(
+                    "[hotswap] round={total_rounds} version={version} elapsed={:.0}s \
+                     ops={total_ops} mismatches={total_mismatches} cache={max_cache_entries}",
+                    elapsed.as_secs_f64(),
+                );
+            }
+        }
+    }
+
+    let elapsed = start_time.elapsed();
+    println!("=== HOT-SWAP VALIDATION REPORT ===");
+    println!("elapsed:    {:.1}s", elapsed.as_secs_f64());
+    println!("rounds:     {total_rounds}");
+    println!("versions:   {total_versions}");
+    println!("ops:        tested={total_ops} skipped={total_skipped} mismatches={total_mismatches}");
+    println!("max cache:  {max_cache_entries} entries");
+    println!(
+        "mutations:  add_field={} rename_field={} add_type={} identity={}",
+        mutation_counts[0], mutation_counts[1], mutation_counts[2], mutation_counts[3],
+    );
+    println!();
+
+    if total_mismatches > 0 {
+        println!("FAIL: {total_mismatches} hot-swap mismatches found");
+        std::process::exit(1);
+    } else {
+        println!("PASS: all hot-swap plans match fresh plans");
+    }
+}
+
+// =========================================================================
+// Schema mutation helpers
+// =========================================================================
+
 /// Mutate a supergraph SDL by adding a new leaf field to the first non-root
 /// object type that has a @join__type directive. Returns None if no suitable
 /// type can be found.
-fn mutate_supergraph_add_field(schema_sdl: &str) -> Option<String> {
+fn mutate_supergraph_add_field(schema_sdl: &str, version: u64) -> Option<String> {
     // Extract first join__Graph enum value
     let graph_enum_value = {
         let mut in_enum = false;
@@ -1629,7 +1880,7 @@ fn mutate_supergraph_add_field(schema_sdl: &str) -> Option<String> {
 
             if brace_depth == 0 && trimmed.contains('}') && !inserted {
                 result.push_str(&format!(
-                    "  _carryoverTestField: String @join__field(graph: {})\n",
+                    "  _hotSwapField{version}: String @join__field(graph: {})\n",
                     graph_enum_value
                 ));
                 inserted = true;
@@ -1646,4 +1897,110 @@ fn mutate_supergraph_add_field(schema_sdl: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Mutate by renaming an existing non-key field. This changes the API schema
+/// surface without adding or removing condition edges — tests that the cache
+/// correctly handles field identity changes.
+fn mutate_supergraph_rename_field(schema_sdl: &str, version: u64) -> Option<String> {
+    // Find the first field line that has @join__field and doesn't start with underscore
+    let mut result = String::with_capacity(schema_sdl.len() + 100);
+    let mut renamed = false;
+
+    for line in schema_sdl.lines() {
+        let trimmed = line.trim();
+        if !renamed
+            && trimmed.contains("@join__field")
+            && !trimmed.starts_with('_')
+            && !trimmed.starts_with("id")
+        {
+            // Extract field name (first word before the colon)
+            if let Some(colon_pos) = trimmed.find(':') {
+                let field_name = trimmed[..colon_pos].trim();
+                if !field_name.is_empty()
+                    && field_name != "id"
+                    && !field_name.starts_with("__")
+                {
+                    let new_name = format!("{field_name}Renamed{version}");
+                    let new_line = line.replace(field_name, &new_name);
+                    result.push_str(&new_line);
+                    result.push('\n');
+                    renamed = true;
+                    continue;
+                }
+            }
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    if renamed { Some(result) } else { None }
+}
+
+/// Mutate by adding an entirely new type with a query field. This adds new
+/// nodes and edges to the QueryGraph — tests that the cache handles graph
+/// expansion correctly.
+fn mutate_supergraph_add_type(schema_sdl: &str, version: u64) -> Option<String> {
+    // Extract first join__Graph enum value
+    let graph_enum_value = {
+        let mut in_enum = false;
+        let mut found = None;
+        for line in schema_sdl.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("enum join__Graph") {
+                in_enum = true;
+                continue;
+            }
+            if in_enum {
+                if trimmed == "}" { break; }
+                if trimmed.contains("@join__graph(") {
+                    if let Some(name) = trimmed.split_whitespace().next() {
+                        found = Some(name.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        found?
+    };
+
+    let type_name = format!("_HotSwapType{version}");
+    let field_name = format!("_hotSwapQuery{version}");
+
+    // Add the new type definition and a query field for it
+    let mut result = String::with_capacity(schema_sdl.len() + 500);
+    let mut added_query_field = false;
+
+    for line in schema_sdl.lines() {
+        let trimmed = line.trim();
+
+        // Add a query field inside `type Query`
+        if !added_query_field && trimmed == "}" {
+            // Check if the previous content was inside type Query
+            // We look for a simple heuristic: was the last type declaration Query?
+        }
+
+        result.push_str(line);
+        result.push('\n');
+
+        // After `type Query ... {` line, inject a new query field
+        if !added_query_field && trimmed.starts_with("type Query") && trimmed.contains('{') {
+            result.push_str(&format!(
+                "  {field_name}: {type_name} @join__field(graph: {graph_enum_value})\n"
+            ));
+            added_query_field = true;
+        }
+    }
+
+    if !added_query_field {
+        return None;
+    }
+
+    // Append the new type definition at the end
+    result.push_str(&format!(
+        "\ntype {type_name}\n  @join__type(graph: {graph_enum_value})\n{{\n  \
+         id: ID!\n  name: String\n}}\n"
+    ));
+
+    Some(result)
 }
