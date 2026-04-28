@@ -252,12 +252,6 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     num_extensions: usize,
 
-    /// In preset warm mode, also generate random operations against the
-    /// preset's composed supergraph (in addition to the preset stress
-    /// queries). This combines the preset's large-schema structure with
-    /// random query surface for broader coverage.
-    #[arg(long, default_value_t = false)]
-    random_ops: bool,
 }
 
 impl Args {
@@ -979,13 +973,6 @@ fn run_warm_mode(
     gen_cfg: GenConfig,
     op_cfg: OpGenConfig,
 ) {
-    // Preset path: compose once, use preset stress queries
-    if let Some(preset) = args.build_preset() {
-        run_warm_mode_preset(args, seed, cfg, opts, preset, op_cfg);
-        return;
-    }
-
-    // Random generation path (original)
     let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut samples: Vec<WarmSample> = Vec::new();
     let mut schemas_attempted: u64 = 0;
@@ -998,40 +985,87 @@ fn run_warm_mode(
     let mut current_planner: Option<HeadPlanner> = None;
     let mut current_supergraph: Option<String> = None;
     let mut ops_done_for_schema: u64 = 0;
+    let progress_interval = args.progress_interval();
+    let start_time = Instant::now();
+
+    // If a preset is specified, compose it once up front and use it as
+    // the fixed schema for the entire run. The schema never rotates —
+    // only the random operations change. This is the normal way to run
+    // presets: the schema provides pathological structure, the fuzzer
+    // provides query variety.
+    if let Some(preset) = args.build_preset() {
+        eprintln!(
+            "Composing preset schema ({} subgraphs)...",
+            preset.subgraphs.len(),
+        );
+        let supergraph_sdl = match try_compose(&preset.subgraphs) {
+            ComposeOutcome::Composed { supergraph_sdl } => supergraph_sdl,
+            ComposeOutcome::ParseFailed { errors } => {
+                eprintln!("Preset subgraph parse failed:");
+                for e in &errors { eprintln!("  {e}"); }
+                std::process::exit(1);
+            }
+            ComposeOutcome::CompositionFailed { errors } => {
+                eprintln!("Preset composition failed:");
+                for e in &errors { eprintln!("  {e}"); }
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "Composed: {} bytes. Building planner...",
+            supergraph_sdl.len()
+        );
+        let planner = match HeadPlanner::build(&supergraph_sdl, &cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to build planner: {e}");
+                std::process::exit(1);
+            }
+        };
+        schemas_attempted = 1;
+        schemas_composed = 1;
+        schemas_built = 1;
+        current_planner = Some(planner);
+        current_supergraph = Some(supergraph_sdl);
+        // Never rotate — ops_per_schema is effectively infinite for presets
+    }
 
     let mut i: u64 = 0;
     while args.should_run(i) {
-        let need_new_schema = args.smoke_fixture && current_planner.is_none()
-            || (!args.smoke_fixture
-                && (current_planner.is_none() || ops_done_for_schema >= args.ops_per_schema));
+        // Schema rotation (only for random-gen mode, not presets)
+        if args.preset.is_none() {
+            let need_new_schema = args.smoke_fixture && current_planner.is_none()
+                || (!args.smoke_fixture
+                    && (current_planner.is_none() || ops_done_for_schema >= args.ops_per_schema));
 
-        if need_new_schema {
-            let bytes = next_bytes(&mut state, 4096);
-            let subgraphs = if args.smoke_fixture {
-                smoke_test_fixture()
-            } else {
-                let mut u = Unstructured::new(&bytes);
-                match generate_federated_subgraphs(&mut u, &gen_cfg) {
-                    Ok(s) => s,
+            if need_new_schema {
+                let bytes = next_bytes(&mut state, 4096);
+                let subgraphs = if args.smoke_fixture {
+                    smoke_test_fixture()
+                } else {
+                    let mut u = Unstructured::new(&bytes);
+                    match generate_federated_subgraphs(&mut u, &gen_cfg) {
+                        Ok(s) => s,
+                        Err(_) => { i += 1; continue; },
+                    }
+                };
+                schemas_attempted += 1;
+                let supergraph_sdl = match try_compose(&subgraphs) {
+                    ComposeOutcome::Composed { supergraph_sdl } => {
+                        schemas_composed += 1;
+                        supergraph_sdl
+                    }
+                    _ => { i += 1; continue; },
+                };
+                let planner = match HeadPlanner::build(&supergraph_sdl, &cfg) {
+                    Ok(p) => p,
                     Err(_) => { i += 1; continue; },
-                }
-            };
-            schemas_attempted += 1;
-            let supergraph_sdl = match try_compose(&subgraphs) {
-                ComposeOutcome::Composed { supergraph_sdl } => {
-                    schemas_composed += 1;
-                    supergraph_sdl
-                }
-                _ => { i += 1; continue; },
-            };
-            let planner = match HeadPlanner::build(&supergraph_sdl, &cfg) {
-                Ok(p) => p,
-                Err(_) => { i += 1; continue; },
-            };
-            schemas_built += 1;
-            current_planner = Some(planner);
-            current_supergraph = Some(supergraph_sdl);
-            ops_done_for_schema = 0;
+                };
+                schemas_built += 1;
+                current_planner = Some(planner);
+                current_supergraph = Some(supergraph_sdl);
+                ops_done_for_schema = 0;
+            }
         }
 
         let Some(planner) = current_planner.as_ref() else {
@@ -1063,6 +1097,19 @@ fn run_warm_mode(
 
         ops_done_for_schema += 1;
         i += 1;
+
+        if progress_interval > 0 && i % progress_interval == 0 {
+            let elapsed = start_time.elapsed();
+            let rate = i as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "[progress] iter={i} elapsed={:.0}s rate={rate:.0}/s \
+                 sampled={} skipped={ops_skipped} errored={ops_errored} \
+                 cache={}",
+                elapsed.as_secs_f64(),
+                samples.len(),
+                current_planner.as_ref().map_or(0, |p| p.condition_resolver_cache_len()),
+            );
+        }
     }
 
     print_warm_report(
@@ -1070,131 +1117,6 @@ fn run_warm_mode(
         schemas_attempted,
         schemas_composed,
         schemas_built,
-        ops_attempted,
-        ops_skipped,
-        ops_errored,
-    );
-}
-
-fn run_warm_mode_preset(
-    args: Args,
-    seed: u64,
-    cfg: CommonConfig,
-    opts: CommonOptions,
-    preset: PresetSchema,
-    op_cfg: OpGenConfig,
-) {
-    eprintln!(
-        "Composing preset schema ({} subgraphs, {} stress queries)...",
-        preset.subgraphs.len(),
-        preset.stress_queries.len(),
-    );
-
-    let supergraph_sdl = match try_compose(&preset.subgraphs) {
-        ComposeOutcome::Composed { supergraph_sdl } => supergraph_sdl,
-        ComposeOutcome::ParseFailed { errors } => {
-            eprintln!("Preset subgraph parse failed:");
-            for e in &errors {
-                eprintln!("  {e}");
-            }
-            std::process::exit(1);
-        }
-        ComposeOutcome::CompositionFailed { errors } => {
-            eprintln!("Preset composition failed:");
-            for e in &errors {
-                eprintln!("  {e}");
-            }
-            std::process::exit(1);
-        }
-    };
-
-    eprintln!(
-        "Composed supergraph: {} bytes. Building planner...",
-        supergraph_sdl.len()
-    );
-
-    let planner = match HeadPlanner::build(&supergraph_sdl, &cfg) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to build planner: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let mut samples: Vec<WarmSample> = Vec::new();
-    let mut ops_errored: u64 = 0;
-    let mut ops_skipped: u64 = 0;
-    let mut ops_attempted: u64 = 0;
-
-    // Phase 1: preset stress queries
-    eprintln!("Running {} stress queries x {} warm repeats...",
-        preset.stress_queries.len(), args.warm_repeats);
-
-    for (qi, pq) in preset.stress_queries.iter().enumerate() {
-        if should_stop() { break; }
-        eprintln!("  query {:>2}: {} ...", qi, pq.name);
-        ops_attempted += 1;
-        let sample = measure_warm_sample(
-            &planner,
-            &pq.query,
-            &opts,
-            args.warm_repeats,
-            true,
-            qi as u64,
-        );
-        match sample {
-            Some(s) => samples.push(s),
-            None => {
-                ops_errored += 1;
-                eprintln!("    ERROR: planning failed for {}", pq.name);
-            }
-        }
-    }
-
-    // Phase 2: random operations against the preset's schema (if --random-ops)
-    if args.random_ops && !should_stop() {
-        let random_count = if args.is_unbounded() {
-            u64::MAX
-        } else {
-            args.iterations
-        };
-        eprintln!("Running random ops against preset schema (Ctrl-C to stop)...");
-        let mut state = seed.wrapping_add(0xDEAD_BEEF_CAFE_BABE);
-        let mut ri: u64 = 0;
-        while ri < random_count && !should_stop() {
-            let op_bytes = next_bytes(&mut state, 1024);
-            ops_attempted += 1;
-            let op_text = match generate_operation_with_config(&supergraph_sdl, &op_bytes, &op_cfg)
-            {
-                Ok(op) => op,
-                Err(_) => {
-                    ops_skipped += 1;
-                    ri += 1;
-                    continue;
-                }
-            };
-            let idx = preset.stress_queries.len() as u64 + ri;
-            let sample = measure_warm_sample(
-                &planner,
-                &op_text,
-                &opts,
-                args.warm_repeats,
-                args.verbose,
-                idx,
-            );
-            match sample {
-                Some(s) => samples.push(s),
-                None => ops_errored += 1,
-            }
-            ri += 1;
-        }
-    }
-
-    print_warm_report(
-        &samples,
-        1,
-        1,
-        1,
         ops_attempted,
         ops_skipped,
         ops_errored,
