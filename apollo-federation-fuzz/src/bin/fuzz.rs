@@ -124,6 +124,9 @@ enum PresetKind {
     Deep,
     /// Mesh: N subgraphs extending multiple core entities with cross-@requires.
     Mesh,
+    /// Diamond: 10 domain subgraphs + N service subgraphs with multi-key entities,
+    /// @provides, @requires chains, and diamond-shaped fetch dependencies.
+    Diamond,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -316,6 +319,7 @@ impl Args {
             PresetKind::Wide => apollo_federation_fuzz::preset_schemas::wide_fan_out(&preset_cfg),
             PresetKind::Deep => apollo_federation_fuzz::preset_schemas::deep_chain(&preset_cfg),
             PresetKind::Mesh => apollo_federation_fuzz::preset_schemas::mesh(&preset_cfg),
+            PresetKind::Diamond => apollo_federation_fuzz::preset_schemas::diamond(&preset_cfg),
         })
     }
 
@@ -1043,6 +1047,38 @@ fn run_warm_mode(
         schemas_attempted = 1;
         schemas_composed = 1;
         schemas_built = 1;
+
+        // Run preset stress queries first (these are hand-crafted to hit
+        // the worst-case patterns: all-service queries, cross-entity traversals)
+        if !preset.stress_queries.is_empty() {
+            eprintln!(
+                "Running {} stress queries x {} warm repeats...",
+                preset.stress_queries.len(),
+                args.warm_repeats,
+            );
+            for (qi, pq) in preset.stress_queries.iter().enumerate() {
+                if should_stop() { break; }
+                eprintln!("  query {:>2}: {} ...", qi, pq.name);
+                ops_attempted += 1;
+                let sample = measure_warm_sample(
+                    &planner,
+                    &pq.query,
+                    &opts,
+                    args.warm_repeats,
+                    true,
+                    qi as u64,
+                );
+                match sample {
+                    Some(s) => samples.push(s),
+                    None => {
+                        ops_errored += 1;
+                        eprintln!("    ERROR: planning failed for {}", pq.name);
+                    }
+                }
+            }
+            eprintln!("Running random ops against preset schema (Ctrl-C to stop)...");
+        }
+
         current_planner = Some(planner);
         current_supergraph = Some(supergraph_sdl);
         // Never rotate — ops_per_schema is effectively infinite for presets
