@@ -1741,6 +1741,7 @@ fn run_hot_swap_mode(
             };
 
             // Build fresh planner (reference — no carryover)
+            let t_build = Instant::now();
             let planner_fresh = match HeadPlanner::build(&next_sdl, &cfg) {
                 Ok(p) => p,
                 Err(_) => {
@@ -1748,8 +1749,10 @@ fn run_hot_swap_mode(
                     continue;
                 }
             };
+            let fresh_build_ms = t_build.elapsed().as_millis();
 
             // Build carryover planner (with previous version's cache)
+            let t_carry = Instant::now();
             let planner_carryover = match HeadPlanner::build_with_previous_cache(
                 &next_sdl,
                 &cfg,
@@ -1758,8 +1761,16 @@ fn run_hot_swap_mode(
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            let carry_build_ms = t_carry.elapsed().as_millis();
 
             total_versions += 1;
+
+            if args.verbose {
+                eprintln!(
+                    "  [v{version}] build: fresh={fresh_build_ms}ms carry={carry_build_ms}ms sdl={}KB",
+                    next_sdl.len() / 1024,
+                );
+            }
 
             // Generate some new operations for this schema version too
             for _ in 0..5 {
@@ -1770,6 +1781,7 @@ fn run_hot_swap_mode(
             }
 
             // Validate: plan each operation through both fresh and carryover
+            let t_plan = Instant::now();
             for op in &op_pool {
                 total_ops += 1;
                 let fresh_result = planner_fresh.plan(op, None, &opts);
@@ -1815,10 +1827,19 @@ fn run_hot_swap_mode(
                 }
             }
 
+            let plan_ms = t_plan.elapsed().as_millis();
+
             // Track cache growth after planning ops through this version
             let cache_len = planner_carryover.condition_resolver_cache_len();
             if cache_len > max_cache_entries {
                 max_cache_entries = cache_len;
+            }
+
+            if args.verbose {
+                eprintln!(
+                    "  [v{version}] plan: {plan_ms}ms ({} ops x2) cache={cache_len}",
+                    op_pool.len(),
+                );
             }
 
             // The carryover planner becomes the current planner for the next version
