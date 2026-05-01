@@ -125,6 +125,10 @@ enum Command {
         /// Path to a Rover supergraph config YAML file.
         #[arg(long, conflicts_with = "schemas")]
         config: Option<PathBuf>,
+        /// Directory to write precomputed artifacts (e.g. query graph cache).
+        /// When provided, writes a `.querygraph.bin` file alongside the supergraph SDL.
+        #[arg(long)]
+        artifact_dir: Option<PathBuf>,
     },
     /// Expand and validate a subgraph schema and print the result
     Subgraph {
@@ -218,7 +222,7 @@ fn main() -> ExitCode {
         Command::Validate { schemas } => cmd_validate(&schemas),
         Command::Subgraph { subgraph_schema } => cmd_subgraph(&subgraph_schema),
         Command::Satisfiability { supergraph_schema } => cmd_satisfiability(&supergraph_schema),
-        Command::Compose { schemas, config } => cmd_compose(&schemas, config.as_ref()),
+        Command::Compose { schemas, config, artifact_dir } => cmd_compose(&schemas, config.as_ref(), artifact_dir.as_ref()),
         Command::Extract {
             supergraph_schema,
             destination_dir,
@@ -561,7 +565,7 @@ fn cmd_satisfiability(file_path: &Path) -> Result<(), AnyError> {
     }
 }
 
-fn cmd_compose(file_paths: &[PathBuf], config_path: Option<&PathBuf>) -> Result<(), AnyError> {
+fn cmd_compose(file_paths: &[PathBuf], config_path: Option<&PathBuf>, artifact_dir: Option<&PathBuf>) -> Result<(), AnyError> {
     let config_path = if let Some((first, rest)) = file_paths.split_first()
         && rest.is_empty()
         && (first.extension().is_some_and(|ext| ext == "yaml")
@@ -575,7 +579,7 @@ fn cmd_compose(file_paths: &[PathBuf], config_path: Option<&PathBuf>) -> Result<
     } else {
         config_path
     };
-    let supergraph = if let Some(config) = config_path {
+    let mut supergraph = if let Some(config) = config_path {
         compose_from_config(config)?
     } else if !file_paths.is_empty() {
         compose_files(file_paths)?
@@ -584,6 +588,21 @@ fn cmd_compose(file_paths: &[PathBuf], config_path: Option<&PathBuf>) -> Result<
     };
 
     println!("{}", supergraph.schema().schema());
+
+    // Write precomputed QueryGraph artifact if requested.
+    if let Some(dir) = artifact_dir {
+        if let Some(artifact) = supergraph.take_query_graph_artifact() {
+            fs::create_dir_all(dir)?;
+            let artifact_path = dir.join("supergraph.querygraph.bin");
+            fs::write(&artifact_path, &artifact)?;
+            eprintln!(
+                "Wrote QueryGraph artifact: {} ({}KB)",
+                artifact_path.display(),
+                artifact.len() / 1024,
+            );
+        }
+    }
+
     let hints = supergraph.hints();
     if !hints.is_empty() {
         eprintln!("{num_hints} HINTS generated:", num_hints = hints.len());

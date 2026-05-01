@@ -48,6 +48,7 @@ use crate::schema::position::TypeDefinitionPosition;
 use crate::schema::position::UnionTypeDefinitionPosition;
 use crate::schema::validators::from_context::parse_context;
 use crate::supergraph::extract_subgraphs_from_supergraph;
+use crate::supergraph::extract_subgraphs_from_supergraph_incremental;
 use crate::utils::FallibleIterator;
 use crate::validate_supergraph_for_query_planning;
 
@@ -100,6 +101,127 @@ pub fn build_federated_query_graph(
                 .build()
             })?;
     FederatedQueryGraphBuilder::new(query_graph, supergraph_schema)?.build()
+}
+
+/// Result of an incremental query graph build, including the graph and metadata
+/// needed for subsequent incremental builds.
+pub struct IncrementalQueryGraphResult {
+    /// The built query graph.
+    pub query_graph: QueryGraph,
+    /// The extracted subgraph schemas, keyed by subgraph name. Pass this to
+    /// the next `build_federated_query_graph_incremental` call as `previous_subgraphs`.
+    pub subgraph_schemas: IndexMap<Arc<str>, ValidFederationSchema>,
+    /// Number of subgraphs that were actually changed (re-extracted and re-validated).
+    /// The remaining subgraphs reused their previously validated schemas.
+    pub changed_subgraph_count: usize,
+    /// Total number of subgraphs.
+    pub total_subgraph_count: usize,
+    /// Timing breakdown of the build phases in milliseconds.
+    pub timing: IncrementalBuildTiming,
+}
+
+/// Timing breakdown for an incremental query graph build.
+#[derive(Debug, Default)]
+pub struct IncrementalBuildTiming {
+    /// Time spent extracting subgraph schemas from the supergraph SDL.
+    pub extract_subgraphs_ms: u128,
+    /// Time spent building per-subgraph query graph nodes/edges.
+    pub schema_query_graph_ms: u128,
+    /// Time spent building cross-subgraph federated edges + precomputing indices.
+    pub federated_graph_ms: u128,
+}
+
+/// Builds a federated query graph incrementally, reusing previously validated subgraph schemas
+/// when unchanged. This is dramatically faster than `build_federated_query_graph` on schema
+/// hot reloads where only a few subgraphs have changed.
+///
+/// On the first call (no previous subgraphs), pass `None` — this degrades to the same behavior
+/// as `build_federated_query_graph` with full validation.
+///
+/// On subsequent calls, pass the `subgraph_schemas` from the previous result. The function
+/// compares each newly extracted subgraph's SDL with the cached version and only validates
+/// subgraphs whose SDL has changed.
+pub fn build_federated_query_graph_incremental(
+    supergraph_schema: ValidFederationSchema,
+    api_schema: ValidFederationSchema,
+    previous_subgraphs: Option<&IndexMap<Arc<str>, ValidFederationSchema>>,
+    for_query_planning: Option<bool>,
+) -> Result<IncrementalQueryGraphResult, FederationError> {
+    use std::time::Instant;
+    let for_query_planning = for_query_planning.unwrap_or(true);
+    let mut timing = IncrementalBuildTiming::default();
+
+    let empty_map = IndexMap::default();
+    let prev = previous_subgraphs.unwrap_or(&empty_map);
+
+    let t0 = Instant::now();
+    let (subgraphs, changed_subgraph_count) = if prev.is_empty() {
+        // No previous subgraphs — do a full extraction with validation.
+        let subgraphs = extract_subgraphs_from_supergraph(&supergraph_schema, Some(true))?;
+        let count = subgraphs.subgraphs.len();
+        (subgraphs, count)
+    } else {
+        // Incremental: reuse unchanged subgraphs, only validate changed ones.
+        extract_subgraphs_from_supergraph_incremental(&supergraph_schema, prev)?
+    };
+    timing.extract_subgraphs_ms = t0.elapsed().as_millis();
+
+    let total_subgraph_count = subgraphs.subgraphs.len();
+
+    // Collect the validated subgraph schemas for the caller to cache.
+    let subgraph_schemas: IndexMap<Arc<str>, ValidFederationSchema> = subgraphs
+        .subgraphs
+        .iter()
+        .map(|(name, sg)| (name.clone(), sg.schema.clone()))
+        .collect();
+
+    let query_graph = QueryGraph {
+        current_source: "".into(),
+        graph: Default::default(),
+        sources: Default::default(),
+        subgraphs_by_name: Default::default(),
+        supergraph_schema: Default::default(),
+        types_to_nodes_by_source: Default::default(),
+        root_kinds_to_nodes_by_source: Default::default(),
+        non_trivial_followup_edges: Default::default(),
+        arguments_to_context_ids_by_source: Default::default(),
+        override_condition_labels: Default::default(),
+        non_local_selection_metadata: Default::default(),
+        field_edge_index: Default::default(),
+        semantic_edge_to_index: Default::default(),
+        semantic_index_to_edge: Default::default(),
+        semantic_node_to_index: Default::default(),
+        semantic_index_to_node: Default::default(),
+    };
+
+    let t1 = Instant::now();
+    let query_graph =
+        subgraphs
+            .into_iter()
+            .fallible_fold(query_graph, |query_graph, (subgraph_name, subgraph)| {
+                SchemaQueryGraphBuilder::new(
+                    query_graph,
+                    subgraph_name,
+                    subgraph.schema,
+                    Some(api_schema.clone()),
+                    for_query_planning,
+                    Default::default(),
+                )?
+                .build()
+            })?;
+    timing.schema_query_graph_ms = t1.elapsed().as_millis();
+
+    let t2 = Instant::now();
+    let query_graph = FederatedQueryGraphBuilder::new(query_graph, supergraph_schema)?.build()?;
+    timing.federated_graph_ms = t2.elapsed().as_millis();
+
+    Ok(IncrementalQueryGraphResult {
+        query_graph,
+        subgraph_schemas,
+        changed_subgraph_count,
+        total_subgraph_count,
+        timing,
+    })
 }
 
 // PORT_NOTE: Corresponds to `buildSupergraphAPIQueryGraph` from JS.

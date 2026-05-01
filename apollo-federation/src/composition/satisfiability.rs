@@ -17,6 +17,7 @@ use crate::merger::merge::CompositionOptions;
 use crate::query_graph::QueryGraph;
 use crate::query_graph::build_federated_query_graph;
 use crate::query_graph::build_supergraph_api_query_graph;
+use crate::query_graph::portable::PortableQueryGraph;
 use crate::schema::ValidFederationSchema;
 use crate::supergraph::CompositionHint;
 use crate::supergraph::Merged;
@@ -30,22 +31,40 @@ pub fn validate_satisfiability(
     let supergraph_schema = supergraph.schema().clone();
     let mut errors = vec![];
     let mut hints = supergraph.hints_mut().drain(..).collect();
-    validate_satisfiability_inner(supergraph, &mut errors, &mut hints).map_err(|e| {
-        vec![CompositionError::InternalError {
-            message: e.to_string(),
-        }]
-    })?;
+    let federated_query_graph =
+        validate_satisfiability_inner(supergraph, &mut errors, &mut hints).map_err(|e| {
+            vec![CompositionError::InternalError {
+                message: e.to_string(),
+            }]
+        })?;
     if !errors.is_empty() {
         return Err(errors);
     }
-    Ok(Supergraph::<Satisfiable>::new(supergraph_schema, hints))
+
+    // Serialize the QueryGraph built during satisfiability validation as a portable
+    // artifact. The router can load this to bypass rebuilding the QueryGraph from scratch.
+    let supergraph_sdl = supergraph_schema.schema().serialize().to_string();
+    let portable = PortableQueryGraph::from_query_graph(federated_query_graph.as_ref(), &supergraph_sdl);
+    let artifact_bytes = portable.to_bytes();
+    trace!(
+        "Serialized QueryGraph artifact: {}KB ({} nodes, {} edges)",
+        artifact_bytes.len() / 1024,
+        portable.node_count(),
+        portable.edge_count(),
+    );
+
+    Ok(Supergraph::<Satisfiable>::new_with_artifact(
+        supergraph_schema,
+        hints,
+        artifact_bytes,
+    ))
 }
 
 fn validate_satisfiability_inner(
     supergraph: Supergraph<Merged>,
     errors: &mut Vec<CompositionError>,
     hints: &mut Vec<CompositionHint>,
-) -> Result<(), FederationError> {
+) -> Result<Arc<QueryGraph>, FederationError> {
     let supergraph_schema = supergraph.schema();
     let api_schema = api_schema::to_api_schema(supergraph_schema.clone(), Default::default())?;
 
@@ -53,23 +72,23 @@ fn validate_satisfiability_inner(
     let api_schema_query_graph =
         build_supergraph_api_query_graph(supergraph_schema.clone(), api_schema.clone())?;
     trace!("Building federated query graph");
-    let federated_query_graph = build_federated_query_graph(
+    let federated_query_graph = Arc::new(build_federated_query_graph(
         supergraph_schema.clone(),
         api_schema.clone(),
         Some(true),
         Some(false),
-    )?;
+    )?);
     trace!("Validating graph composition");
     validate_graph_composition(
         supergraph_schema.clone(),
         Arc::new(api_schema_query_graph),
-        Arc::new(federated_query_graph),
+        federated_query_graph.clone(),
         // TODO: Pass composition options through once upstream function APIs have been updated.
         &Default::default(),
         errors,
         hints,
     )?;
-    Ok(())
+    Ok(federated_query_graph)
 }
 
 /// Validates that all the queries expressible on the API schema resulting from the composition of

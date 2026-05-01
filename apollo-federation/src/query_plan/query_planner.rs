@@ -31,6 +31,7 @@ use crate::query_graph::OverrideConditions;
 use crate::query_graph::QueryGraph;
 use crate::query_graph::QueryGraphNodeType;
 use crate::query_graph::build_federated_query_graph;
+use crate::query_graph::build_federated_query_graph_incremental;
 use crate::query_graph::condition_resolver::SharedConditionResolverCache;
 use crate::query_graph::path_tree::OpPathTree;
 use crate::query_plan::PlanNode;
@@ -416,6 +417,13 @@ pub struct QueryPlanner {
     /// lifetime of this planner (one schema version). Condition resolutions computed during one
     /// query's planning are reused by subsequent queries, avoiding redundant sub-traversals.
     condition_resolver_cache: SharedConditionResolverCache,
+    /// Cached extracted subgraph schemas from the most recent build. Used by
+    /// `new_incremental` to avoid re-extracting and re-validating unchanged
+    /// subgraphs on schema hot-reload. Keyed by subgraph name.
+    subgraph_schemas: IndexMap<Arc<str>, ValidFederationSchema>,
+    /// Timing from the last incremental build (extract_ms, schema_graph_ms, federated_graph_ms).
+    /// Only populated when built via `new_incremental`.
+    last_build_timing: (u128, u128, u128),
 }
 
 impl QueryPlanner {
@@ -545,7 +553,148 @@ impl QueryPlanner {
             interface_types_with_interface_objects,
             abstract_types_with_inconsistent_runtime_types,
             condition_resolver_cache,
+            subgraph_schemas: IndexMap::default(),
+            last_build_timing: (0, 0, 0),
         })
+    }
+
+    /// Create a new `QueryPlanner` incrementally, reusing unchanged subgraph schemas from
+    /// a previous planner. This is dramatically faster than `new` / `new_with_previous_cache`
+    /// on schema hot-reloads where only a few subgraphs have changed, because it skips
+    /// re-extraction and re-validation for unchanged subgraphs.
+    ///
+    /// Pass `previous_planner` from the previous schema version. Its cached subgraph schemas
+    /// and condition resolver cache are both used for incremental construction.
+    pub fn new_incremental(
+        supergraph: &Supergraph,
+        config: QueryPlannerConfig,
+        previous_planner: Option<&QueryPlanner>,
+    ) -> Result<Self, FederationError> {
+        let supergraph_schema = supergraph.schema.clone();
+        let api_schema = supergraph.to_api_schema(ApiSchemaOptions {
+            include_defer: config.incremental_delivery.enable_defer,
+            ..Default::default()
+        })?;
+
+        let prev_subgraphs = previous_planner.map(|p| &p.subgraph_schemas);
+
+        let result = build_federated_query_graph_incremental(
+            supergraph_schema.clone(),
+            api_schema.clone(),
+            prev_subgraphs,
+            Some(true),
+        )?;
+
+        if result.changed_subgraph_count < result.total_subgraph_count {
+            trace!(
+                "Incremental build: {}/{} subgraphs reused, {} changed",
+                result.total_subgraph_count - result.changed_subgraph_count,
+                result.total_subgraph_count,
+                result.changed_subgraph_count,
+            );
+        }
+
+        let query_graph = result.query_graph;
+        let subgraph_schemas = result.subgraph_schemas;
+        let build_timing = (
+            result.timing.extract_subgraphs_ms,
+            result.timing.schema_query_graph_ms,
+            result.timing.federated_graph_ms,
+        );
+
+        let interface_types_with_interface_objects = supergraph
+            .schema
+            .get_types()
+            .filter_map(|position| match position {
+                TypeDefinitionPosition::Interface(interface_position) => Some(interface_position),
+                _ => None,
+            })
+            .map(|position| {
+                let is_interface_object = query_graph
+                    .subgraphs()
+                    .map(|(_name, schema)| {
+                        let Some(position) = schema.try_get_type(position.type_name.clone()) else {
+                            return Ok(false);
+                        };
+                        schema.is_interface_object_type(position)
+                    })
+                    .process_results(|mut iter| iter.any(|b| b))?;
+                Ok::<_, FederationError>((position, is_interface_object))
+            })
+            .process_results(|iter| {
+                iter.flat_map(|(position, is_interface_object)| {
+                    if is_interface_object {
+                        Some(position)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<IndexSet<_>>()
+            })?;
+
+        let is_inconsistent = |position: AbstractTypeDefinitionPosition| {
+            let mut sources = query_graph.subgraphs().filter_map(|(_name, subgraph)| {
+                match subgraph.try_get_type(position.type_name().clone())? {
+                    TypeDefinitionPosition::Object(_) => None,
+                    TypeDefinitionPosition::Interface(interface) => Some(
+                        subgraph
+                            .referencers()
+                            .get_interface_type(&interface.type_name)
+                            .ok()?
+                            .object_types
+                            .clone(),
+                    ),
+                    TypeDefinitionPosition::Union(union_) => Some(
+                        union_
+                            .try_get(subgraph.schema())?
+                            .members
+                            .iter()
+                            .map(|member| ObjectTypeDefinitionPosition::new(member.name.clone()))
+                            .collect(),
+                    ),
+                    _ => None,
+                }
+            });
+
+            let Some(expected_runtimes) = sources.next() else {
+                return false;
+            };
+            !sources.all(|runtimes| runtimes == expected_runtimes)
+        };
+
+        let abstract_types_with_inconsistent_runtime_types = supergraph
+            .schema
+            .get_types()
+            .filter_map(|position| AbstractTypeDefinitionPosition::try_from(position).ok())
+            .filter(|position| is_inconsistent(position.clone()))
+            .map(|position| position.type_name().clone())
+            .collect::<IndexSet<_>>();
+
+        let condition_resolver_cache = SharedConditionResolverCache::new();
+        if let Some(prev) = previous_planner {
+            let imported =
+                condition_resolver_cache.import_from(&prev.condition_resolver_cache, &query_graph);
+            trace!(
+                "Imported {imported} condition resolver cache entries from previous schema version"
+            );
+        }
+
+        Ok(Self {
+            config,
+            federated_query_graph: Arc::new(query_graph),
+            supergraph_schema,
+            api_schema,
+            interface_types_with_interface_objects,
+            abstract_types_with_inconsistent_runtime_types,
+            condition_resolver_cache,
+            subgraph_schemas,
+            last_build_timing: build_timing,
+        })
+    }
+
+    /// Returns timing from the last incremental build: (extract_ms, schema_graph_ms, federated_graph_ms).
+    pub fn last_build_timing(&self) -> (u128, u128, u128) {
+        self.last_build_timing
     }
 
     pub fn subgraph_schemas(&self) -> &IndexMap<Arc<str>, ValidFederationSchema> {
@@ -793,9 +942,8 @@ impl QueryPlanner {
         &self.condition_resolver_cache
     }
 
-    /// Returns a reference to the federated query graph. Useful for testing SemanticEdgeId stability.
-    #[cfg(test)]
-    pub(crate) fn query_graph(&self) -> &QueryGraph {
+    /// Returns a reference to the federated query graph.
+    pub fn query_graph(&self) -> &QueryGraph {
         &self.federated_query_graph
     }
 

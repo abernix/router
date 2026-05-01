@@ -164,6 +164,26 @@ impl Supergraph<Satisfiable> {
                     abstract_types_with_inconsistent_runtime_types: Default::default(),
                 },
                 hints,
+                query_graph_artifact: None,
+            },
+        }
+    }
+
+    /// Create with a pre-serialized QueryGraph artifact from composition.
+    pub fn new_with_artifact(
+        schema: ValidFederationSchema,
+        hints: Vec<CompositionHint>,
+        query_graph_artifact: Vec<u8>,
+    ) -> Self {
+        Supergraph {
+            state: Satisfiable {
+                schema,
+                metadata: SupergraphMetadata {
+                    interface_types_with_interface_objects: Default::default(),
+                    abstract_types_with_inconsistent_runtime_types: Default::default(),
+                },
+                hints,
+                query_graph_artifact: Some(query_graph_artifact),
             },
         }
     }
@@ -193,6 +213,17 @@ impl Supergraph<Satisfiable> {
     pub fn hints_mut(&mut self) -> &mut Vec<CompositionHint> {
         &mut self.state.hints
     }
+
+    /// Returns the pre-serialized QueryGraph artifact if one was produced during composition.
+    /// This artifact can be loaded by the router to bypass QueryGraph construction.
+    pub fn query_graph_artifact(&self) -> Option<&[u8]> {
+        self.state.query_graph_artifact.as_deref()
+    }
+
+    /// Takes ownership of the QueryGraph artifact, leaving None in its place.
+    pub fn take_query_graph_artifact(&mut self) -> Option<Vec<u8>> {
+        self.state.query_graph_artifact.take()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +237,9 @@ pub struct Satisfiable {
     schema: ValidFederationSchema,
     metadata: SupergraphMetadata,
     hints: Vec<CompositionHint>,
+    /// Pre-serialized QueryGraph artifact (bincode) from composition.
+    /// When present, the router can load this instead of rebuilding the QueryGraph.
+    query_graph_artifact: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -338,6 +372,118 @@ pub(crate) fn extract_subgraphs_from_supergraph(
     }
 
     Ok(valid_subgraphs)
+}
+
+/// Like `extract_subgraphs_from_supergraph`, but reuses previously validated subgraph schemas
+/// when the newly extracted schema's SDL matches the cached version. This avoids redundant
+/// schema validation on hot reloads where only a few subgraphs have changed.
+///
+/// Returns `(subgraphs, changed_count)` where `changed_count` is the number of subgraphs
+/// that were actually re-validated (vs reused from the cache).
+pub(crate) fn extract_subgraphs_from_supergraph_incremental(
+    supergraph_schema: &FederationSchema,
+    previous_subgraphs: &IndexMap<Arc<str>, ValidFederationSchema>,
+) -> Result<(ValidFederationSubgraphs, usize), FederationError> {
+    let (link_spec_definition, join_spec_definition, context_spec_definition) =
+        crate::validate_supergraph_for_query_planning(supergraph_schema)?;
+    let is_fed_1 = *join_spec_definition.version() == Version { major: 0, minor: 1 };
+    if is_fed_1 {
+        return Err(SingleFederationError::UnsupportedFederationVersion {
+            message: String::from(
+                "Supergraphs composed with federation version 1 are not supported. Please recompose your supergraph with federation version 2 or greater",
+            ),
+        }
+        .into());
+    }
+
+    let (mut subgraphs, federation_spec_definitions, graph_enum_value_name_to_subgraph_name) =
+        collect_empty_subgraphs(supergraph_schema, join_spec_definition)?;
+
+    let filtered_types: Vec<_> = supergraph_schema
+        .get_types()
+        .fallible_filter(|type_definition_position| {
+            join_spec_definition
+                .is_spec_type_name(supergraph_schema, type_definition_position.type_name())
+                .map(Not::not)
+        })
+        .and_then_filter(|type_definition_position| {
+            link_spec_definition
+                .is_spec_type_name(supergraph_schema, type_definition_position.type_name())
+                .map(Not::not)
+        })
+        .try_collect()?;
+
+    extract_subgraphs_from_fed_2_supergraph(
+        supergraph_schema,
+        &mut subgraphs,
+        &graph_enum_value_name_to_subgraph_name,
+        &federation_spec_definitions,
+        join_spec_definition,
+        context_spec_definition,
+        &filtered_types,
+    )?;
+
+    for graph_enum_value in graph_enum_value_name_to_subgraph_name.keys() {
+        let subgraph = get_subgraph(
+            &mut subgraphs,
+            &graph_enum_value_name_to_subgraph_name,
+            graph_enum_value,
+        )?;
+        let federation_spec_definition = federation_spec_definitions
+            .get(graph_enum_value)
+            .ok_or_else(|| SingleFederationError::InvalidFederationSupergraph {
+                message: "Subgraph unexpectedly does not use federation spec".to_owned(),
+            })?;
+        add_federation_operations(subgraph, federation_spec_definition)?;
+    }
+
+    let mut valid_subgraphs = ValidFederationSubgraphs::new();
+    let mut changed_count = 0;
+
+    for (_, subgraph) in subgraphs {
+        let subgraph_name: Arc<str> = subgraph.name.as_str().into();
+
+        // Check if we have a cached version and the SDL matches.
+        let reused = if let Some(prev_schema) = previous_subgraphs.get(&subgraph_name) {
+            let new_sdl = subgraph.schema.schema().serialize().to_string();
+            let prev_sdl = prev_schema.schema().serialize().to_string();
+            if new_sdl == prev_sdl {
+                // SDL matches — reuse the previously validated schema.
+                Some(prev_schema.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let valid_subgraph_schema = if let Some(cached) = reused {
+            cached
+        } else {
+            // New or changed subgraph — validate from scratch.
+            changed_count += 1;
+            match subgraph.schema.validate_or_return_self() {
+                Ok(schema) => schema,
+                Err((_schema, error)) => {
+                    let message = format!(
+                        "Unexpected error extracting {} from the supergraph: this is either a bug, or the supergraph has been corrupted.\n\nDetails:\n{error}",
+                        subgraph.name,
+                    );
+                    return Err(
+                        SingleFederationError::InvalidFederationSupergraph { message }.into(),
+                    );
+                }
+            }
+        };
+
+        valid_subgraphs.add(ValidFederationSubgraph {
+            name: subgraph.name,
+            url: subgraph.url,
+            schema: valid_subgraph_schema,
+        })?;
+    }
+
+    Ok((valid_subgraphs, changed_count))
 }
 
 type CollectEmptySubgraphsOk = (

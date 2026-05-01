@@ -42,8 +42,12 @@ pub(crate) mod condition_resolver;
 pub(crate) mod graph_path;
 pub mod output;
 pub(crate) mod path_tree;
+pub mod portable;
 
+pub use build_query_graph::IncrementalBuildTiming;
+pub use build_query_graph::IncrementalQueryGraphResult;
 pub use build_query_graph::build_federated_query_graph;
+pub use build_query_graph::build_federated_query_graph_incremental;
 pub use build_query_graph::build_supergraph_api_query_graph;
 pub use condition_resolver::SharedConditionResolverCache;
 use graph_path::operation::OpGraphPathContext;
@@ -849,6 +853,32 @@ impl QueryGraph {
 
     pub(crate) fn is_context_used(&self) -> bool {
         !self.arguments_to_context_ids_by_source.is_empty()
+    }
+
+    // --- Accessors for portable serialization ---
+
+    pub(crate) fn root_kinds_to_nodes_by_source_map(
+        &self,
+    ) -> &IndexMap<Arc<str>, IndexMap<SchemaRootDefinitionKind, NodeIndex>> {
+        &self.root_kinds_to_nodes_by_source
+    }
+
+    pub(crate) fn types_to_nodes_by_source_map(
+        &self,
+    ) -> &IndexMap<Arc<str>, IndexMap<NamedType, IndexSet<NodeIndex>>> {
+        &self.types_to_nodes_by_source
+    }
+
+    pub(crate) fn non_trivial_followup_edges_map(
+        &self,
+    ) -> &IndexMap<EdgeIndex, Vec<EdgeIndex>> {
+        &self.non_trivial_followup_edges
+    }
+
+    pub(crate) fn field_edge_index_map(
+        &self,
+    ) -> &HashMap<(NodeIndex, Name), Vec<EdgeIndex>> {
+        &self.field_edge_index
     }
 
     pub(crate) fn non_local_selection_metadata(

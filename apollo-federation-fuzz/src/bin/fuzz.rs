@@ -1562,7 +1562,7 @@ fn run_carryover_mode(
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            let carryover_plan = match planner_v2_carryover.plan(op_text, None, &opts) {
+            let incremental_plan = match planner_v2_carryover.plan(op_text, None, &opts) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("CARRYOVER PLAN FAILED: {e}\n  op: {op_text}");
@@ -1572,7 +1572,7 @@ fn run_carryover_mode(
                 }
             };
 
-            if normalize_plan(&fresh_plan) != normalize_plan(&carryover_plan) {
+            if normalize_plan(&fresh_plan) != normalize_plan(&incremental_plan) {
                 mismatches += 1;
                 eprintln!(
                     "CARRYOVER MISMATCH (schema_round={_schema_round} cache_len={v1_cache_len} mutated={}):",
@@ -1582,7 +1582,7 @@ fn run_carryover_mode(
                 // Print a short diff
                 let fresh_str = serde_json::to_string_pretty(&fresh_plan).unwrap_or_default();
                 let carryover_str =
-                    serde_json::to_string_pretty(&carryover_plan).unwrap_or_default();
+                    serde_json::to_string_pretty(&incremental_plan).unwrap_or_default();
                 for change in similar::TextDiff::from_lines(&fresh_str, &carryover_str)
                     .iter_all_changes()
                 {
@@ -1741,33 +1741,58 @@ fn run_hot_swap_mode(
             };
 
             // Build fresh planner (reference — no carryover)
-            let t_build = Instant::now();
-            let planner_fresh = match HeadPlanner::build(&next_sdl, &cfg) {
-                Ok(p) => p,
-                Err(_) => {
-                    // Mutation produced invalid schema; skip this version
-                    continue;
-                }
-            };
-            let fresh_build_ms = t_build.elapsed().as_millis();
+            let (planner_fresh, fresh_parse_ms, fresh_graph_ms) =
+                match HeadPlanner::build_with_timing(&next_sdl, &cfg) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Mutation produced invalid schema; skip this version
+                        continue;
+                    }
+                };
+            let fresh_build_ms = fresh_parse_ms + fresh_graph_ms;
 
-            // Build carryover planner (with previous version's cache)
-            let t_carry = Instant::now();
-            let planner_carryover = match HeadPlanner::build_with_previous_cache(
-                &next_sdl,
-                &cfg,
-                current_planner.condition_resolver_cache(),
-            ) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let carry_build_ms = t_carry.elapsed().as_millis();
+            // Measure portable QueryGraph serialization/deserialization (on first version only)
+            if args.verbose && version == 1 {
+                match planner_fresh.measure_portable_full_roundtrip(&next_sdl) {
+                    Ok((ser_ms, recon_ms, bincode_size, json_size, nodes, edges, timing_detail)) => {
+                        eprintln!(
+                            "  [portable] serialize={ser_ms}ms reconstruct={recon_ms}ms \
+                             bincode={}KB json={}KB nodes={nodes} edges={edges} \
+                             (vs fresh build: {}ms)",
+                            bincode_size / 1024,
+                            json_size / 1024,
+                            fresh_build_ms,
+                        );
+                        eprintln!("  [portable]   {timing_detail}");
+                    }
+                    Err(e) => {
+                        eprintln!("  [portable] ERROR: {e}");
+                    }
+                }
+            }
+
+            // Build incremental planner (reuses unchanged subgraph schemas + condition cache)
+            let (planner_incremental, incr_parse_ms, extract_ms, schema_graph_ms, fed_graph_ms) =
+                match HeadPlanner::build_incremental_with_timing(
+                    &next_sdl,
+                    &cfg,
+                    &current_planner,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+            let incr_build_ms = incr_parse_ms + extract_ms + schema_graph_ms + fed_graph_ms;
 
             total_versions += 1;
 
             if args.verbose {
+                let speedup = if incr_build_ms > 0 {
+                    format!("{:.1}x", fresh_build_ms as f64 / incr_build_ms as f64)
+                } else {
+                    "inf".to_string()
+                };
                 eprintln!(
-                    "  [v{version}] build: fresh={fresh_build_ms}ms carry={carry_build_ms}ms sdl={}KB",
+                    "  [v{version}] fresh: parse={fresh_parse_ms}ms graph={fresh_graph_ms}ms | incr: parse={incr_parse_ms}ms extract={extract_ms}ms schema_graph={schema_graph_ms}ms fed_graph={fed_graph_ms}ms ({speedup}) sdl={}KB",
                     next_sdl.len() / 1024,
                 );
             }
@@ -1785,11 +1810,11 @@ fn run_hot_swap_mode(
             for op in &op_pool {
                 total_ops += 1;
                 let fresh_result = planner_fresh.plan(op, None, &opts);
-                let carryover_result = planner_carryover.plan(op, None, &opts);
+                let incremental_result = planner_incremental.plan(op, None, &opts);
 
-                match (fresh_result, carryover_result) {
-                    (Ok(fresh_plan), Ok(carryover_plan)) => {
-                        if normalize_plan(&fresh_plan) != normalize_plan(&carryover_plan) {
+                match (fresh_result, incremental_result) {
+                    (Ok(fresh_plan), Ok(incremental_plan)) => {
+                        if normalize_plan(&fresh_plan) != normalize_plan(&incremental_plan) {
                             total_mismatches += 1;
                             eprintln!(
                                 "HOTSWAP MISMATCH: round={total_rounds} version={version} \
@@ -1798,9 +1823,9 @@ fn run_hot_swap_mode(
                             eprintln!("  op: {op}");
                             let fresh_str =
                                 serde_json::to_string_pretty(&fresh_plan).unwrap_or_default();
-                            let carry_str =
-                                serde_json::to_string_pretty(&carryover_plan).unwrap_or_default();
-                            for change in similar::TextDiff::from_lines(&fresh_str, &carry_str)
+                            let incr_str =
+                                serde_json::to_string_pretty(&incremental_plan).unwrap_or_default();
+                            for change in similar::TextDiff::from_lines(&fresh_str, &incr_str)
                                 .iter_all_changes()
                             {
                                 let sign = match change.tag() {
@@ -1830,7 +1855,7 @@ fn run_hot_swap_mode(
             let plan_ms = t_plan.elapsed().as_millis();
 
             // Track cache growth after planning ops through this version
-            let cache_len = planner_carryover.condition_resolver_cache_len();
+            let cache_len = planner_incremental.condition_resolver_cache_len();
             if cache_len > max_cache_entries {
                 max_cache_entries = cache_len;
             }
@@ -1843,7 +1868,7 @@ fn run_hot_swap_mode(
             }
 
             // The carryover planner becomes the current planner for the next version
-            current_planner = planner_carryover;
+            current_planner = planner_incremental;
             current_sdl = next_sdl;
 
             if progress_interval > 0 && total_versions % progress_interval == 0 {

@@ -949,7 +949,7 @@ pub(crate) struct QueryGraphMetadata {
     /// nodes of the complete digraph for I are indirect options for such nodes of type T. We
     /// track any such types I that are reachable for at least one node in the complete digraph
     /// for type T here as well.
-    types_to_indirect_options: IndexMap<Name, IndirectOptionsMetadata>,
+    pub(crate) types_to_indirect_options: IndexMap<Name, IndirectOptionsMetadata>,
     /// For nodes of a type T that aren't in their complete digraph (due to not having a @key),
     /// these remaining nodes will have the complete digraph of T (and any interface object
     /// complete digraphs) as indirect options, but these remaining nodes may separately have
@@ -957,23 +957,23 @@ pub(crate) struct QueryGraphMetadata {
     /// if the complete digraph for T has no key resolution edges to an interface object I, but
     /// this remaining node does. We keep track of such interface object types for those
     /// remaining nodes here.
-    remaining_nodes_to_interface_object_options: IndexMap<NodeIndex, IndexSet<Name>>,
+    pub(crate) remaining_nodes_to_interface_object_options: IndexMap<NodeIndex, IndexSet<Name>>,
     /// A map of field names to the endpoints of field query graph edges with that field name. Note
     /// we additionally store the progressive overrides label, if the edge is conditioned on it.
-    fields_to_endpoints: IndexMap<Name, IndexMap<NodeIndex, FieldTarget>>,
+    pub(crate) fields_to_endpoints: IndexMap<Name, IndexMap<NodeIndex, FieldTarget>>,
     /// A map of type condition names to endpoints of downcast query graph edges with that type
     /// condition name, including fake downcasts for interface objects, and a non-existent edge that
     /// represents a type condition name equal to the parent type.
-    inline_fragments_to_endpoints: IndexMap<Name, IndexMap<NodeIndex, NodeIndex>>,
+    pub(crate) inline_fragments_to_endpoints: IndexMap<Name, IndexMap<NodeIndex, NodeIndex>>,
     /// A map of composite type nodes to their downcast edges that lead specifically to an object
     /// type (i.e., the possible runtime types of the node's type).
-    nodes_to_object_type_downcasts: IndexMap<NodeIndex, ObjectTypeDowncasts>,
+    pub(crate) nodes_to_object_type_downcasts: IndexMap<NodeIndex, ObjectTypeDowncasts>,
     /// A map of field names to parent nodes whose corresponding type and schema can be rebased on
     /// by the field.
-    fields_to_rebaseable_parent_nodes: IndexMap<Name, IndexSet<NodeIndex>>,
+    pub(crate) fields_to_rebaseable_parent_nodes: IndexMap<Name, IndexSet<NodeIndex>>,
     /// A map of type condition names to parent nodes whose corresponding type and schema can be
     /// rebased on by an inline fragment with that type condition.
-    inline_fragments_to_rebaseable_parent_nodes: IndexMap<Name, IndexSet<NodeIndex>>,
+    pub(crate) inline_fragments_to_rebaseable_parent_nodes: IndexMap<Name, IndexSet<NodeIndex>>,
 }
 
 /// Indirect option metadata for the complete digraph for type T. See [QueryGraphMetadata] for
@@ -981,14 +981,14 @@ pub(crate) struct QueryGraphMetadata {
 #[derive(Debug, Default)]
 pub(crate) struct IndirectOptionsMetadata {
     /// The members of the complete digraph for type T.
-    same_type_options: IndexSet<NodeIndex>,
+    pub(crate) same_type_options: IndexSet<NodeIndex>,
     /// Any interface object types I that are reachable for at least one node in the complete
     /// digraph for type T.
-    interface_object_options: IndexSet<Name>,
+    pub(crate) interface_object_options: IndexSet<Name>,
 }
 
 #[derive(Debug)]
-enum FieldTarget {
+pub(crate) enum FieldTarget {
     /// Normal non-overridden fields, which don't have a label condition.
     NonOverride(NodeIndex),
     /// Overridden fields, which have a label condition.
@@ -996,7 +996,7 @@ enum FieldTarget {
 }
 
 #[derive(Debug)]
-enum ObjectTypeDowncasts {
+pub(crate) enum ObjectTypeDowncasts {
     /// Normal non-interface-object types have regular downcasts to their object type nodes.
     NonInterfaceObject(IndexMap<Name, NodeIndex>),
     /// Interface object types have "fake" downcasts to nodes that are really the self node.
